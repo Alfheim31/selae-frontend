@@ -113,7 +113,7 @@ echo "Wrote .gitignore"
 # --- dependencies -------------------------------------------------
 echo ""
 echo "Installing dependencies. This takes a minute or two."
-npm install react react-dom recharts lucide-react --silent
+npm install react react-dom recharts lucide-react zxing-wasm jsbarcode --silent
 npm install -D vite @vitejs/plugin-react tailwindcss @tailwindcss/vite --silent
 
 # --- report -------------------------------------------------------

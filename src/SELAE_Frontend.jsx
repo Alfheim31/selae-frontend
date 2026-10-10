@@ -2,8 +2,10 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, AreaChart, Area } from "recharts";
 import {
   LayoutDashboard, ScanLine, BarChart3, Search, CheckCircle2, XCircle, AlertTriangle, Camera, CameraOff,
-  Volume2, VolumeX, Lock, Download, History, HelpCircle, Ban, Keyboard,
+  Volume2, VolumeX, Lock, Download, History, HelpCircle, Ban, Keyboard, Barcode, Printer,
 } from "lucide-react";
+import JsBarcode from "jsbarcode";
+import { useBarcodeScanner, parseStudentId } from "./barcode.js";
 
 /* ------------------------------------------------------------------
    SELAE — Smart Event Logistics and Analytics Engine
@@ -162,6 +164,13 @@ const CSS = `
 .toast{position:fixed;right:20px;bottom:20px;background:var(--raised);border:1px solid var(--line);padding:.7rem 1rem;
   border-radius:12px;font-weight:700;z-index:50}
 
+.testgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:1rem}
+.testcard{background:#fff;color:#10182C;border-radius:14px;padding:1rem 1rem .5rem;display:flex;flex-direction:column;align-items:center;text-align:center}
+.testcard svg{max-width:100%;height:auto}
+@media print{
+  .selae{background:#fff;color:#000} .rail,.selae header,.noprint{display:none !important}
+  .testcard{border:1px solid #999;break-inside:avoid}
+}
 @media (prefers-reduced-motion: reduce){ .selae *{animation:none !important; transition:none !important} }
 `;
 
@@ -171,6 +180,7 @@ const OPEN_MINUTES = 42;
 const MOUNT = Date.now();
 const simNow = () => new Date(BASE.getTime() + OPEN_MINUTES * 60000 + (Date.now() - MOUNT));
 const CAPACITY = 200;
+const VIEWS = ["dashboard", "scanner", "analytics", "testids"];
 const EVENT = { title: "CS Department General Assembly", venue: "University Gymnasium", date: "Friday, September 18, 2026" };
 
 const fmtTime = (d) => {
@@ -287,7 +297,17 @@ export default function App() {
   const seed = useMemo(() => buildData(), []);
   const [checkins, setCheckins] = useState(seed.checkins);
   const [log, setLog] = useState(seed.log);
-  const [view, setView] = useState("dashboard");
+  const [view, setViewState] = useState(() => {
+    const h = typeof window !== "undefined" ? window.location.hash.slice(1) : "";
+    return VIEWS.includes(h) ? h : "dashboard";
+  });
+  // Mirror the view in the URL so e.g. /#testids can be opened directly on a phone
+  const setView = (v) => { setViewState(v); try { window.history.replaceState(null, "", `#${v}`); } catch { /* sandboxed */ } };
+  useEffect(() => {
+    const onHash = () => { const h = window.location.hash.slice(1); if (VIEWS.includes(h)) setViewState(h); };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
   const [gateMode, setGateMode] = useState(false);
   const [now, setNow] = useState(simNow());
   const [toast, setToast] = useState("");
@@ -357,6 +377,7 @@ export default function App() {
     { id: "dashboard", label: "Live dashboard", icon: LayoutDashboard },
     { id: "scanner", label: "Gate scanner", icon: ScanLine },
     { id: "analytics", label: "Analytics", icon: BarChart3 },
+    { id: "testids", label: "Test IDs", icon: Barcode },
   ];
 
   return (
@@ -413,6 +434,7 @@ export default function App() {
             {view === "dashboard" && <Dashboard data={data} onOpenScanner={() => setView("scanner")} />}
             {view === "scanner" && <Scanner data={data} actions={actions} gateMode={gateMode} setGateMode={setGateMode} />}
             {view === "analytics" && <Analytics data={data} onToast={setToast} />}
+            {view === "testids" && <TestIds seed={seed} onOpenScanner={() => setView("scanner")} />}
           </div>
         </main>
       </div>
@@ -841,6 +863,28 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
     cam.freeze();
   };
 
+  // A barcode was decoded from the live camera feed
+  const handleDecoded = (raw) => {
+    clearTimers();
+    setCard(null); setGlare(false); setResult(null);
+    setPath(["barcode"]);
+    const id = parseStudentId(raw);
+    const student = id ? actions.student(id) : null;
+    if (student) { decide(student, "barcode", 1); return; }
+    actions.logScan({ sid: null, outcome: "unresolved", method: "barcode" });
+    setResult({ type: "unknown", read: raw.length > 40 ? raw.slice(0, 40) + "…" : raw });
+    setPath(["barcode", "result"]);
+    setPhase("result");
+    cam.freeze();
+    beep("error");
+  };
+  const engine = useBarcodeScanner({
+    videoRef: cam.videoRef,
+    running: live,
+    ready: phase === "idle" && !result,
+    onDetect: handleDecoded,
+  });
+
   const run = (kind) => {
     if (!cameraUsable) return;
     reset();
@@ -937,14 +981,15 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
             {live ? (
               <>
                 <div className="vf-status">
-                  <span className="dot" style={{ background: "var(--ok)" }} /> Camera live
+                  <span className="dot" style={{ background: engine === "error" ? "var(--warn)" : "var(--ok)" }} />
+                  {engine === "ready" ? "Scanning for barcodes" : engine === "error" ? "Barcode reader failed to load, use manual entry" : "Camera live, loading barcode reader"}
                 </div>
                 <div className="frame" aria-hidden="true">
                   <span className="corner tl" /><span className="corner tr" /><span className="corner bl" /><span className="corner br" />
                   {phase === "barcode" && <div className="sweep" />}
                 </div>
                 {phase === "ocr" && <div className="ocr-tag">Reading the printed student number</div>}
-                {phase === "idle" && <div className="vf-note">Hold the ID inside the frame</div>}
+                {phase === "idle" && <div className="vf-note">Hold the ID barcode inside the frame. If it doesn't read, move it closer.</div>}
                 {phase === "result" && <div className="vf-note">Frame held</div>}
               </>
             ) : cameraOn && cam.state !== "starting" ? (
@@ -1052,7 +1097,7 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
         <div className="state">{camera ? <ScanLine size={24} color="var(--gold)" /> : <AlertTriangle size={24} color="var(--warn)" />} {camera ? "Ready for the next attendee" : "Scanning paused"}</div>
         <p className="muted text-lg">{camera
           ? (live
-            ? "Camera is live. Ask the attendee to hold their student ID inside the frame. Decoding is not wired up yet, so use a demo scenario to walk through a check-in."
+            ? "Camera is live. Ask the attendee to hold the barcode on their student ID inside the frame. It checks in as soon as the code is read. The OCR fallback is still simulated, so use the demo scenarios for that path."
             : "Ask the attendee to hold their student ID inside the frame. If the barcode can't be read, SELAE reads the printed student number.")
           : "The camera is off. Use manual entry to keep checking attendees in."}</p>
       </div>
@@ -1130,6 +1175,17 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
             ))}
           </div>
           <button className="btn btn-on mt-auto" onClick={onNone}>None of these, type it instead</button>
+        </div>
+      );
+    case "unknown":
+      return (
+        <div className="result warn">
+          <div className="state"><HelpCircle size={28} /> No student with this number</div>
+          <p className="text-lg">The barcode read <strong style={{ wordBreak: "break-all" }}>{result.read}</strong>, but it doesn't match any student number on file. Check the ID, then type the number or name in manual entry.</p>
+          <div className="flex flex-col gap-2 mt-auto">
+            <button className="btn btn-on" onClick={onManual} autoFocus><Keyboard size={16} /> Go to manual entry</button>
+            <button className="btn btn-on" onClick={onReset}>Next attendee</button>
+          </div>
         </div>
       );
     default:
@@ -1295,6 +1351,77 @@ function Analytics({ data, onToast }) {
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/* ---------------- test IDs ---------------- */
+/* Printable barcodes for students in the sample data, so the live
+   scanner can be tested and demoed without real student IDs. */
+function IdBarcode({ value }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    try {
+      JsBarcode(ref.current, value, {
+        format: "CODE128", width: 2, height: 64, margin: 12, displayValue: true,
+        font: "Atkinson Hyperlegible, sans-serif", fontSize: 15, background: "#ffffff", lineColor: "#000000",
+      });
+    } catch { /* invalid value */ }
+  }, [value]);
+  return <svg ref={ref} role="img" aria-label={`Barcode for ${value}`} />;
+}
+
+function TestIds({ seed, onOpenScanner }) {
+  const groups = useMemo(() => {
+    const { students, registered, checkins } = seed;
+    return [
+      { key: "ok", title: "Registered, not yet checked in", expect: "Checks in (green)",
+        list: students.filter((s) => registered.has(s.id) && !checkins.has(s.id)).slice(0, 6) },
+      { key: "dup", title: "Already checked in", expect: "Already checked in (blue)",
+        list: students.filter((s) => checkins.has(s.id)).slice(0, 3) },
+      { key: "notreg", title: "Not registered for this event", expect: "Not registered (red)",
+        list: students.filter((s) => !registered.has(s.id)).slice(0, 3) },
+    ];
+  }, [seed]);
+
+  return (
+    <div className="flex flex-col gap-6">
+      <section className="flex flex-wrap items-end justify-between gap-4 noprint">
+        <div style={{ maxWidth: 720 }}>
+          <h2 className="font-bold text-2xl">Test IDs</h2>
+          <p className="muted mt-1">
+            Barcodes for students in the sample data. Print this page, or open it on your phone and hold the screen up to the
+            webcam on the Gate scanner. Each group shows the result you should get the first time you scan it.
+          </p>
+          <p className="faint text-sm mt-2">
+            To open it on a phone, run <code>npm run dev -- --host</code> and visit the Network address it prints, followed by <code>/#testids</code>.
+            Turn the phone's brightness up. Glare on the screen is the most common reason a code won't read.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button className="btn" onClick={() => window.print()}><Printer size={17} /> Print</button>
+          <button className="btn btn-gold" onClick={onOpenScanner}><ScanLine size={17} /> Open gate scanner</button>
+        </div>
+      </section>
+
+      {groups.map((g) => (
+        <section key={g.key} className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="font-bold text-lg">{g.title}</h3>
+            <span className="text-sm faint">Expected: {g.expect}</span>
+          </div>
+          <div className="testgrid">
+            {g.list.map((s) => (
+              <div key={s.id} className="testcard">
+                <div className="font-bold">{formatName(s)}</div>
+                <div className="text-sm" style={{ color: "#4A5675" }}>{s.section}</div>
+                <IdBarcode value={s.id} />
+              </div>
+            ))}
+          </div>
+        </section>
+      ))}
     </div>
   );
 }
