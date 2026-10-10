@@ -112,7 +112,7 @@ export function Discover() {
         {events && !list.length && (
           <div className="panel p-6 text-center flex flex-col items-center gap-3">
             <p className="muted">{tab === "upcoming" ? "No upcoming events yet." : "No past events."}</p>
-            {tab === "upcoming" && <button className="btn btn-gold" onClick={() => go("create")}><Plus size={17} /> Create an event</button>}
+            {tab === "upcoming" && <button className="btn btn-gold" onClick={() => go("create")}><Plus size={17} /> Create event</button>}
           </div>
         )}
       </div>
