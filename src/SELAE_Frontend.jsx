@@ -1,495 +1,357 @@
-import { useState, useMemo, useEffect, useRef } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, AreaChart, Area } from "recharts";
 import {
   LayoutDashboard, ScanLine, BarChart3, Search, CheckCircle2, XCircle, AlertTriangle, Camera, CameraOff,
-  Volume2, VolumeX, Lock, Download, History, HelpCircle, Ban, Keyboard, Barcode, Printer,
+  Volume2, VolumeX, Lock, Download, History, HelpCircle, Ban, Keyboard, Printer, QrCode as QrIcon, Settings,
+  ArrowLeft, ExternalLink, Copy, Clock, CalendarX, WifiOff,
 } from "lucide-react";
-import JsBarcode from "jsbarcode";
 import { useBarcodeScanner, parseStudentId } from "./barcode.js";
+import { useBeep, HoldToExit, useCamera, CameraStage } from "./camera.jsx";
+import { api, hostKeys } from "./api.js";
+import {
+  CSS, Mark, QrCode, go, useHashRoute, useToast, fmtTime, fmtDate, fmtDateShort, formatName, norm, pct, lev, misread,
+  METHOD_LABEL, METHOD_SHORT, OUTCOME_LABEL,
+} from "./shared.jsx";
+import { TopBar, Discover, EventPage, TicketPage, MyTickets, CreateEvent, EventForm } from "./public.jsx";
 
 /* ------------------------------------------------------------------
    SELAE — Smart Event Logistics and Analytics Engine
-   Clickable prototype of the operator UI (dashboard, gate scanner,
-   post-event analytics). All data is simulated in memory.
+
+   Public side (phones on the venue Wi-Fi): browse events, register,
+   get a QR ticket. Organizer side (the laptop at the gate): live
+   dashboard, gate scanner, analytics, test tickets, settings.
+
+   Routes (hash-based, so any static server works):
+     #/                 events          #/e/:id        event page
+     #/create           create event    #/t/:code      ticket
+     #/tickets          my tickets      #/m/:id/:tab   manage an event
+     #/host/:id/:key    accept a co-host link
 ------------------------------------------------------------------- */
 
-const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap');
-.selae{
-  --bg:#0C1730; --rail:#091226; --surface:#122144; --raised:#1A2C55; --line:#263A69;
-  --text:#EAF0FB; --muted:#A3B1D0; --faint:#7384AB;
-  --gold:#E4B23E; --gold-ink:#241A03; --data:#7FA2FF;
-  --ok:#2FBF76; --ok-ink:#052113; --bad:#C63A3C; --dup:#3D6BDB; --warn:#F39A3D; --warn-ink:#2A1603;
-  font-family:'Atkinson Hyperlegible', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  background:var(--bg); color:var(--text); min-height:100vh; font-variant-numeric:tabular-nums;
-  line-height:1.45;
-}
-.selae *{box-sizing:border-box}
-.selae button{cursor:pointer; font:inherit}
-.selae button:disabled{opacity:.45; cursor:not-allowed}
-.selae :focus-visible{outline:2px solid var(--gold); outline-offset:2px}
-.selae .muted{color:var(--muted)} .selae .faint{color:var(--faint)}
+const TABS = ["dashboard", "scanner", "analytics", "tickets", "settings"];
+const LEGACY = { dashboard: "dashboard", scanner: "scanner", analytics: "analytics", testids: "tickets" };
+const TICKET_RE = /^SELAE1:[a-z0-9-]+:[A-Z2-9]{10}$/;
 
-.rail{background:var(--rail); border-right:1px solid var(--line)}
-.mark{width:34px;height:34px;border-radius:9px;position:relative;background:var(--surface);border:1px solid var(--line)}
-.mark:before,.mark:after{content:"";position:absolute;width:11px;height:11px;border:3px solid var(--gold)}
-.mark:before{top:6px;left:6px;border-right:0;border-bottom:0;border-radius:3px 0 0 0}
-.mark:after{bottom:6px;right:6px;border-left:0;border-top:0;border-radius:0 0 3px 0}
-.navbtn{display:flex;gap:.7rem;align-items:center;padding:.65rem .8rem;border-radius:10px;color:var(--muted);
-  font-weight:700;width:100%;text-align:left;background:transparent;border:0}
-.navbtn:hover{background:var(--surface);color:var(--text)}
-.navbtn[aria-current="page"]{background:var(--surface);color:var(--text);box-shadow:inset 3px 0 0 var(--gold)}
-.mnav{gap:.25rem;overflow-x:auto}
-.mnav .navbtn{width:auto;white-space:nowrap}
-
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:16px}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;font-weight:700;border-radius:10px;
-  padding:.6rem 1rem;border:1px solid var(--line);background:var(--raised);color:var(--text)}
-.btn:hover:not(:disabled){border-color:var(--muted)}
-.btn-gold{background:var(--gold);border-color:var(--gold);color:var(--gold-ink)}
-.btn-gold:hover:not(:disabled){filter:brightness(1.07);border-color:var(--gold)}
-.btn-ghost{background:transparent}
-.btn-sm{padding:.4rem .7rem;font-size:.85rem}
-.field{position:relative}
-.field svg{position:absolute;left:.8rem;top:50%;transform:translateY(-50%);color:var(--faint)}
-.input{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:.7rem .9rem .7rem 2.5rem;
-  color:var(--text);width:100%;font-size:1rem}
-.input::placeholder{color:var(--faint)}
-.input:focus{border-color:var(--gold);outline:none}
-
-.chip{display:inline-flex;align-items:center;gap:.35rem;font-size:.78rem;font-weight:700;padding:.12rem .55rem;
-  border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
-.chip.barcode{color:#B9CBFF;border-color:#3A5596}
-.chip.ocr{color:var(--gold);border-color:#7A6225}
-.chip.confirmed{color:var(--warn);border-color:#7F5424}
-.chip.manual{color:var(--muted)}
-.chip.in{color:var(--ok);border-color:#1F6B47}
-
-.seg{display:inline-flex;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:3px}
-.seg button{border:0;background:transparent;color:var(--muted);font-weight:700;padding:.35rem .75rem;border-radius:7px;font-size:.88rem}
-.seg button[aria-pressed="true"]{background:var(--raised);color:var(--text)}
-
-.tbl{width:100%;border-collapse:separate;border-spacing:0}
-.tbl th{white-space:nowrap;font-weight:700;color:var(--faint);font-size:.8rem;text-align:left;padding:.6rem .9rem;
-  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--surface);z-index:1}
-.tbl td{white-space:nowrap;padding:.62rem .9rem;border-bottom:1px solid rgba(38,58,105,.55);font-size:.92rem;vertical-align:middle}
-.tbl tr:last-child td{border-bottom:0}
-
-.capbar{height:16px;border-radius:999px;background:var(--bg);border:1px solid var(--line);position:relative;overflow:hidden}
-.capfill{height:100%;border-radius:999px;transition:width .5s ease}
-.captick{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--muted)}
-
-.feed li{display:grid;grid-template-columns:22px 1fr auto;gap:.65rem;padding:.7rem 0;border-bottom:1px solid rgba(38,58,105,.55)}
-.feed li:last-child{border-bottom:0}
-
-/* Gate scanner */
-.viewfinder{position:relative;border-radius:18px;overflow:hidden;aspect-ratio:4/3;border:1px solid var(--line);
-  background:radial-gradient(ellipse at 50% 38%, #22314f 0%, #121b30 55%, #0a1020 100%)}
-.frame{position:absolute;left:18%;right:18%;top:16%;bottom:16%}
-.corner{position:absolute;width:42px;height:42px;border:0 solid var(--gold)}
-.corner.tl{top:0;left:0;border-top-width:4px;border-left-width:4px;border-top-left-radius:12px}
-.corner.tr{top:0;right:0;border-top-width:4px;border-right-width:4px;border-top-right-radius:12px}
-.corner.bl{bottom:0;left:0;border-bottom-width:4px;border-left-width:4px;border-bottom-left-radius:12px}
-.corner.br{bottom:0;right:0;border-bottom-width:4px;border-right-width:4px;border-bottom-right-radius:12px}
-.vf-status{position:absolute;left:14px;top:14px;display:flex;align-items:center;gap:.45rem;font-size:.82rem;font-weight:700;
-  background:rgba(9,18,38,.75);padding:.3rem .65rem;border-radius:999px}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.idcard{position:absolute;left:50%;top:50%;width:min(58%,320px);aspect-ratio:1.586;background:#F3F5FA;border-radius:12px;
-  box-shadow:0 22px 44px rgba(0,0,0,.5);overflow:hidden;color:#1B2440;
-  transform:translate(-50%,-50%) rotate(-3deg);transition:transform .35s ease, opacity .3s ease}
-.idcard.away{opacity:0;transform:translate(-50%,-34%) rotate(-3deg) scale(.92)}
-.idcard .band{height:21%;background:#7B1E2A;color:#fff;font-weight:700;font-size:.62rem;display:flex;align-items:center;padding:0 7%}
-.idcard .photo{position:absolute;left:7%;top:30%;width:23%;height:43%;background:#C5CEE2;border-radius:4px}
-.idcard .info{position:absolute;left:36%;top:30%;right:7%}
-.idcard .ln{height:7px;background:#D3DAE8;border-radius:3px;margin-bottom:6px}
-.idcard .num{display:inline-block;font-weight:700;font-size:.9rem;padding:1px 5px;margin:2px 0 0 -5px;border-radius:4px}
-.idcard .num.reading{outline:2px solid #B8860B;outline-offset:1px;background:rgba(228,178,62,.28)}
-.idcard .bars{position:absolute;left:7%;right:7%;bottom:8%;height:13%;
-  background:repeating-linear-gradient(90deg,#1B2440 0 2px,transparent 2px 4px,#1B2440 4px 5px,transparent 5px 8px,#1B2440 8px 11px,transparent 11px 13px)}
-.glare{position:absolute;inset:0;pointer-events:none;
-  background:radial-gradient(circle at 72% 74%, rgba(255,255,255,.97) 0%, rgba(255,255,255,.82) 16%, rgba(255,255,255,0) 42%)}
-.viewfinder video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#0a1020}
-.viewfinder video.frozen{filter:grayscale(.15) brightness(.8)}
-.vf-note{position:absolute;left:50%;bottom:9%;transform:translateX(-50%);background:rgba(9,18,38,.82);color:var(--text);
-  font-weight:700;font-size:.82rem;padding:.3rem .7rem;border-radius:999px;white-space:nowrap}
-.vf-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.75rem;
-  padding:1.5rem;text-align:center}
-.vf-center p{max-width:42ch;color:var(--muted);line-height:1.55}
-.vf-center ol{text-align:left;color:var(--muted);font-size:.92rem;line-height:1.6;max-width:42ch}
-.camselect{background:var(--bg);border:1px solid var(--line);border-radius:9px;color:var(--text);padding:.35rem .55rem;
-  font:inherit;font-size:.85rem;max-width:220px}
-.spin{width:26px;height:26px;border-radius:50%;border:3px solid var(--line);border-top-color:var(--gold);animation:spin .9s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.sweep{position:absolute;left:0;right:0;height:3px;background:var(--gold);box-shadow:0 0 14px var(--gold);animation:sweep 1s ease-in-out infinite alternate}
-@keyframes sweep{from{top:4%}to{top:96%}}
-.ocr-tag{position:absolute;left:50%;bottom:9%;transform:translateX(-50%);background:var(--gold);color:var(--gold-ink);
-  font-weight:700;font-size:.82rem;padding:.3rem .7rem;border-radius:999px;white-space:nowrap}
-
-.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem}
-.step{border-top:3px solid var(--line);padding-top:.45rem;font-size:.8rem;color:var(--faint);font-weight:700}
-.step.active{border-color:var(--gold);color:var(--text)}
-.step.done{border-color:#4E6BAF;color:var(--muted)}
-.step.skipped{border-style:dashed;opacity:.6}
-
-.result{border-radius:18px;padding:1.5rem;height:100%;min-height:260px;display:flex;flex-direction:column;gap:.9rem;
-  transition:background-color .18s ease}
-.result.idle{background:var(--surface);border:1px solid var(--line)}
-.result.ok{background:var(--ok);color:var(--ok-ink)}
-.result.bad{background:var(--bad);color:#fff}
-.result.dup{background:var(--dup);color:#fff}
-.result.warn{background:var(--warn);color:var(--warn-ink)}
-@media (min-width:1024px){.result{min-height:420px}}
-.result .who{text-wrap:balance;font-size:clamp(1.7rem,3.2vw,2.6rem);font-weight:700;line-height:1.1;letter-spacing:-.01em}
-.result .state{display:flex;align-items:center;gap:.6rem;font-size:1.2rem;font-weight:700}
-.result .meta{display:grid;grid-template-columns:auto 1fr;gap:.25rem 1rem;font-size:1rem}
-.result .meta dt{opacity:.75}
-.result .btn-on{background:rgba(255,255,255,.92);color:#10182C;border-color:transparent}
-.result .btn-on:hover:not(:disabled){background:#fff}
-.countdown{height:6px;border-radius:999px;background:rgba(0,0,0,.18);overflow:hidden;margin-top:auto}
-.countdown > div{height:100%;background:currentColor;opacity:.5;animation-name:drain;animation-timing-function:linear;animation-fill-mode:forwards}
-@keyframes drain{from{width:100%}to{width:0}}
-.cand{display:flex;justify-content:space-between;align-items:center;gap:1rem;width:100%;text-align:left;
-  background:rgba(255,255,255,.4);border:2px solid transparent;border-radius:12px;padding:.75rem 1rem;color:inherit}
-.cand:hover{border-color:currentColor;background:rgba(255,255,255,.55)}
-.suggest{position:absolute;left:0;right:0;bottom:calc(100% + 6px);background:var(--raised);border:1px solid var(--line);
-  border-radius:12px;overflow:hidden;z-index:5;box-shadow:0 18px 36px rgba(0,0,0,.4)}
-.suggest button{display:flex;justify-content:space-between;gap:1rem;width:100%;text-align:left;background:transparent;border:0;
-  color:var(--text);padding:.6rem .9rem;border-bottom:1px solid var(--line)}
-.suggest button:last-child{border-bottom:0}
-.suggest button:hover,.suggest button[data-active="true"]{background:var(--surface)}
-.hold{position:relative;overflow:hidden}
-.hold .fill{position:absolute;left:0;top:0;bottom:0;background:rgba(228,178,62,.35)}
-.demo summary{cursor:pointer;font-weight:700;color:var(--muted);list-style:none}
-.demo summary::-webkit-details-marker{display:none}
-.toast{position:fixed;right:20px;bottom:20px;background:var(--raised);border:1px solid var(--line);padding:.7rem 1rem;
-  border-radius:12px;font-weight:700;z-index:50}
-
-.testgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:1rem}
-.testcard{background:#fff;color:#10182C;border-radius:14px;padding:1rem 1rem .5rem;display:flex;flex-direction:column;align-items:center;text-align:center}
-.testcard svg{max-width:100%;height:auto}
-@media print{
-  .selae{background:#fff;color:#000} .rail,.selae header,.noprint{display:none !important}
-  .testcard{border:1px solid #999;break-inside:avoid}
-}
-@media (prefers-reduced-motion: reduce){ .selae *{animation:none !important; transition:none !important} }
-`;
-
-/* ---------------- utilities ---------------- */
-const BASE = new Date(2026, 8, 18, 12, 30); // check-in opened 12:30 PM
-const OPEN_MINUTES = 42;
-const MOUNT = Date.now();
-const simNow = () => new Date(BASE.getTime() + OPEN_MINUTES * 60000 + (Date.now() - MOUNT));
-const CAPACITY = 200;
-const VIEWS = ["dashboard", "scanner", "analytics", "testids"];
-const EVENT = { title: "CS Department General Assembly", venue: "University Gymnasium", date: "Friday, September 18, 2026" };
-
-const fmtTime = (d) => {
-  let h = d.getHours();
-  const m = d.getMinutes();
-  const ap = h >= 12 ? "PM" : "AM";
-  h = h % 12 || 12;
-  return `${h}:${String(m).padStart(2, "0")} ${ap}`;
-};
-const formatName = (s) => `${s.last}${s.suffix ? " " + s.suffix : ""}, ${s.first}${s.middle ? " " + s.middle + "." : ""}`;
-const norm = (t) => t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
-const pct = (n) => `${Math.round(n * 100)}%`;
-
-function lev(a, b) {
-  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
-  for (let j = 1; j <= b.length; j++) d[0][j] = j;
-  for (let i = 1; i <= a.length; i++)
-    for (let j = 1; j <= b.length; j++)
-      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-  return d[a.length][b.length];
-}
-
-// Digits OCR commonly confuses under glare
-const CONFUSE = { 0: "8", 1: "7", 2: "7", 3: "8", 4: "9", 5: "6", 6: "5", 7: "1", 8: "3", 9: "4" };
-function misread(id) {
-  const [yr, num] = id.split("-");
-  const i = Math.floor(Math.random() * num.length);
-  return `${yr}-${num.slice(0, i)}${CONFUSE[num[i]]}${num.slice(i + 1)}`;
-}
-
-const METHOD_LABEL = { barcode: "Barcode", ocr: "OCR", confirmed: "Operator confirmed", manual: "Manual entry" };
-const METHOD_SHORT = { barcode: "Barcode", ocr: "OCR", confirmed: "Confirmed", manual: "Manual" };
-const OUTCOME_LABEL = {
-  approved: "Checked in", notreg: "Not registered", dup: "Already checked in", full: "Venue at capacity", unresolved: "Couldn't identify",
-};
-
-/* ---------------- seeded sample data ---------------- */
-function rng(seed) {
-  let a = seed;
-  return () => {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const SURNAMES = ["Santos", "Reyes", "Garcia", "Mendoza", "Bautista", "Villanueva", "Ramos", "Aquino", "Castillo", "Del Rosario",
-  "De Leon", "Navarro", "Salazar", "Tolentino", "Manalo", "Pascual", "Soriano", "Lim", "Gonzales", "Fernandez", "Cruz", "Rivera",
-  "Ocampo", "Mercado", "Aguilar", "Valdez", "Domingo", "Francisco", "Serrano", "Lopez", "Dizon", "Panganiban", "Sy", "Magbanua"];
-const GIVEN = ["Juan", "Andrea", "Jose", "Kevin", "Patricia", "Mark Anthony", "Kristine", "John Paul", "Angelica", "Carlo", "Bea",
-  "Miguel", "Sofia", "Rafael", "Jasmine", "Paolo", "Nicole", "Gabriel", "Ella", "Joshua", "Camille", "Adrian", "Janelle", "Renz",
-  "Trisha", "Vince", "Alyssa", "Nathan", "Denise", "Lance"];
-const MIDDLES = "ABCDEFGLMNPRSTV";
-const SECTIONS = ["BSCS 1-1", "BSCS 1-2", "BSCS 2-1", "BSCS 2-2", "BSCS 3-1", "BSCS 3-2", "BSCS 3-3", "BSCS 3-4", "BSCS 4-1", "BSCS 4-2"];
-
-function buildData() {
-  const r = rng(315);
-  const pick = (arr) => arr[Math.floor(r() * arr.length)];
-  const used = new Set();
-  const students = [];
-  while (students.length < 230) {
-    const section = pick(SECTIONS);
-    const year = Number(section.split(" ")[1][0]);
-    const id = `${2027 - year}-${10000 + Math.floor(r() * 89999)}`;
-    if (used.has(id)) continue;
-    used.add(id);
-    const sr = r();
-    students.push({ id, section, year, last: pick(SURNAMES), first: pick(GIVEN), middle: r() < 0.1 ? "" : pick(MIDDLES),
-      suffix: sr < 0.03 ? "Jr." : sr < 0.04 ? "III" : "" });
-  }
-  // Names that exercise the formatting rules
-  const showcase = [
-    { last: "Dela Cruz", first: "Juan", middle: "M", suffix: "" },
-    { last: "Santos", first: "Maria Clara", middle: "R", suffix: "" },
-    { last: "Peña", first: "Andrea", middle: "L", suffix: "" },
-    { last: "Reyes", first: "Jose", middle: "P", suffix: "Jr." },
-    { last: "Tan", first: "Kevin", middle: "", suffix: "" },
-    { last: "Delos Santos", first: "John Paul", middle: "V", suffix: "" },
-    { last: "Muñoz", first: "Camille", middle: "S", suffix: "" },
-  ];
-  showcase.forEach((n, i) => Object.assign(students[i], n));
-
-  const byId = new Map(students.map((s) => [s.id, s]));
-  const registered = new Set(students.slice(0, 180).map((s) => s.id));
-
-  // Shuffle registered, check in 128 with a peak around 12:52 PM
-  const reg = students.slice(0, 180);
-  for (let i = reg.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [reg[i], reg[j]] = [reg[j], reg[i]]; }
-  const checkins = new Map();
-  const log = [];
-  const at = (min) => new Date(BASE.getTime() + min * 60000 + Math.floor(r() * 59) * 1000);
-  reg.slice(0, 128).forEach((s) => {
-    const min = Math.min(41, Math.max(0, 22 + (r() + r() + r() - 1.5) * 17));
-    const roll = r();
-    const method = roll < 0.78 ? "barcode" : roll < 0.91 ? "ocr" : roll < 0.96 ? "confirmed" : "manual";
-    const confidence = method === "barcode" ? 1 : method === "ocr" ? 0.9 + r() * 0.09 : method === "confirmed" ? 0.62 + r() * 0.16 : null;
-    const time = at(min);
-    checkins.set(s.id, { time, method, confidence });
-    log.push({ uid: `s${log.length}`, time, sid: s.id, outcome: "approved", method, confidence });
-  });
-  students.slice(180).slice(0, 6).forEach((s) => log.push({ uid: `s${log.length}`, time: at(5 + r() * 36), sid: s.id, outcome: "notreg", method: "barcode" }));
-  [...checkins.keys()].slice(0, 3).forEach((sid) => {
-    const c = checkins.get(sid);
-    log.push({ uid: `s${log.length}`, time: new Date(Math.min(c.time.getTime() + 6 * 60000, BASE.getTime() + 41.5 * 60000)), sid, outcome: "dup", method: "barcode" });
-  });
-  log.push({ uid: `s${log.length}`, time: at(31), sid: null, outcome: "unresolved", method: "ocr" });
-  log.sort((a, b) => b.time - a.time);
-
-  return { students, byId, registered, checkins, log };
-}
-
-/* ---------------- app ---------------- */
 export default function App() {
-  const seed = useMemo(() => buildData(), []);
-  const [checkins, setCheckins] = useState(seed.checkins);
-  const [log, setLog] = useState(seed.log);
-  const [view, setViewState] = useState(() => {
-    const h = typeof window !== "undefined" ? window.location.hash.slice(1) : "";
-    return VIEWS.includes(h) ? h : "dashboard";
-  });
-  // Mirror the view in the URL so e.g. /#testids can be opened directly on a phone
-  const setView = (v) => { setViewState(v); try { window.history.replaceState(null, "", `#${v}`); } catch { /* sandboxed */ } };
-  useEffect(() => {
-    const onHash = () => { const h = window.location.hash.slice(1); if (VIEWS.includes(h)) setViewState(h); };
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
-  }, []);
-  const [gateMode, setGateMode] = useState(false);
-  const [now, setNow] = useState(simNow());
-  const [toast, setToast] = useState("");
-  const checkinsRef = useRef(checkins);
-  checkinsRef.current = checkins;
+  const route = useHashRoute();
+  const parts = route.split("/").filter(Boolean);
 
+  // Old single-event links (#scanner etc.) open the demo event
   useEffect(() => {
-    const t = setInterval(() => setNow(simNow()), 15000);
-    return () => clearInterval(t);
-  }, []);
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(""), 2600);
-    return () => clearTimeout(t);
-  }, [toast]);
+    if (parts.length === 1 && LEGACY[parts[0]]) go(`m/demo-ga/${LEGACY[parts[0]]}`);
+    if (parts[0] === "host" && parts[1] && parts[2]) { hostKeys.add(parts[1], parts[2]); go(`m/${parts[1]}`); }
+  }, [route]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const actions = useMemo(() => {
-    const addLog = (e) => setLog((l) => [{ uid: Math.random().toString(36).slice(2), time: simNow(), ...e }, ...l]);
-    const rnd = (a) => a[Math.floor(Math.random() * a.length)];
-    return {
-      student: (sid) => seed.byId.get(sid),
-      isRegistered: (sid) => seed.registered.has(sid),
-      // Business rules from the Logical Layer: registration, duplicates, capacity
-      evaluate(sid, { forceFull = false } = {}) {
-        const cr = checkinsRef.current;
-        if (!seed.byId.has(sid)) return { outcome: "unresolved" };
-        if (!seed.registered.has(sid)) return { outcome: "notreg" };
-        if (cr.has(sid)) return { outcome: "dup", previous: cr.get(sid) };
-        if (forceFull || cr.size >= CAPACITY) return { outcome: "full" };
-        return { outcome: "approved" };
-      },
-      commit(sid, method, confidence) {
-        const time = simNow();
-        setCheckins((m) => new Map(m).set(sid, { time, method, confidence }));
-        addLog({ sid, outcome: "approved", method, confidence });
-        return time;
-      },
-      logScan: addLog,
-      pickFor(kind) {
-        const cr = checkinsRef.current;
-        if (kind === "notreg") return rnd(seed.students.filter((s) => !seed.registered.has(s.id)));
-        if (kind === "dup") return seed.byId.get(rnd([...cr.keys()]));
-        const pool = seed.students.filter((s) => seed.registered.has(s.id) && !cr.has(s.id));
-        return rnd(pool.length ? pool : seed.students.filter((s) => seed.registered.has(s.id)));
-      },
-      // Fuzzy match of an OCR read against this event's registered list
-      candidates(read) {
-        return [...seed.registered]
-          .map((id) => ({ id, d: lev(read, id) }))
-          .sort((a, b) => a.d - b.d)
-          .slice(0, 3)
-          .map(({ id, d }, i) => ({ student: seed.byId.get(id), confidence: Math.max(0.31, 0.79 - d * 0.13 - i * 0.03 - Math.random() * 0.05) }));
-      },
-      search(q) {
-        const n = norm(q);
-        if (n.length < 2) return [];
-        return seed.students
-          .filter((s) => norm(s.id).includes(n) || norm(s.last + s.first).includes(n) || norm(s.first + s.last).includes(n))
-          .sort((a, b) => Number(seed.registered.has(b.id)) - Number(seed.registered.has(a.id)))
-          .slice(0, 6);
-      },
-    };
-  }, [seed]);
-
-  const data = { ...seed, checkins, log, now };
-  const nav = [
-    { id: "dashboard", label: "Live dashboard", icon: LayoutDashboard },
-    { id: "scanner", label: "Gate scanner", icon: ScanLine },
-    { id: "analytics", label: "Analytics", icon: BarChart3 },
-    { id: "testids", label: "Test IDs", icon: Barcode },
-  ];
+  let page;
+  if (parts[0] === "m" && parts[1]) {
+    page = <Manage id={parts[1]} tab={TABS.includes(parts[2]) ? parts[2] : "dashboard"} />;
+  } else {
+    const inner =
+      parts[0] === "e" && parts[1] ? <EventPage id={parts[1]} /> :
+      parts[0] === "t" && parts[1] ? <TicketPage code={parts[1]} /> :
+      parts[0] === "tickets" ? <MyTickets /> :
+      parts[0] === "create" ? <CreateEvent /> :
+      <Discover />;
+    page = <><TopBar route={parts[0] || ""} />{inner}</>;
+  }
 
   return (
     <div className="selae">
       <style>{CSS}</style>
-      <div className="flex min-h-screen">
+      {page}
+    </div>
+  );
+}
+
+/* ---------------- server state for one event ---------------- */
+function toData(s) {
+  const byId = new Map(s.directory.map((x) => [x.id, x]));
+  const student = (sid) => byId.get(sid) || { id: sid, first: "", last: "", middle: "", suffix: "", section: "" };
+  const regs = s.registrations;
+  const going = regs.filter((r) => r.status === "going");
+  const waitlist = regs.filter((r) => r.status === "waitlist").sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const checkins = new Map(regs.filter((r) => r.checkin).map((r) => [r.studentId, { ...r.checkin, time: new Date(r.checkin.time) }]));
+  return {
+    event: s.event,
+    capacity: s.event.capacity,
+    opens: new Date(s.event.startsAt),
+    ends: new Date(s.event.endsAt),
+    byId, student, regs, going, waitlist, checkins,
+    registered: new Set(going.map((r) => r.studentId)),
+    regByStudent: new Map(regs.filter((r) => r.status !== "cancelled").map((r) => [r.studentId, r])),
+    students: going.map((r) => student(r.studentId)),
+    log: s.logs.map((l) => ({ uid: l.uid, time: new Date(l.time), sid: l.studentId, outcome: l.outcome, method: l.method, confidence: l.confidence })),
+  };
+}
+
+function useManage(id) {
+  const [state, setState] = useState(null);
+  const [error, setError] = useState("");
+  const rev = useRef(null);
+  const refresh = useCallback(async () => {
+    try {
+      const d = await api.manage(id, rev.current);
+      if (!d.unchanged) { rev.current = d.rev; setState(d); }
+      setError("");
+    } catch (e) { setError(e.message); }
+  }, [id]);
+  useEffect(() => {
+    rev.current = null;
+    setState(null);
+    refresh();
+    // Poll so registrations from phones and check-ins from other gates show up within ~2 seconds
+    const t = setInterval(refresh, 2000);
+    return () => clearInterval(t);
+  }, [refresh]);
+  const data = useMemo(() => (state ? toData(state) : null), [state]);
+  return { data, error, refresh };
+}
+
+/* ---------------- organizer shell ---------------- */
+function Manage({ id, tab }) {
+  const { data, error, refresh } = useManage(id);
+  const [gateMode, setGateMode] = useState(false);
+  const [now, setNow] = useState(new Date());
+  const [toast, setToast] = useToast();
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 15000); return () => clearInterval(t); }, []);
+
+  if (!data) {
+    return (
+      <>
+        <TopBar route="" />
+        <div className="narrow py-10">
+          {error ? (
+            <div className="panel p-6 flex flex-col gap-3">
+              <h1 className="font-bold text-xl">{/hosts/.test(error) ? "You don't manage this event on this device" : "Couldn't load this event"}</h1>
+              <p className="muted">{/hosts/.test(error)
+                ? "Events can be managed from the device that created them, from the laptop running SELAE, or by opening a co-host link."
+                : error}</p>
+              <button className="btn self-start" onClick={() => go(`e/${id}`)}>View the event page</button>
+            </div>
+          ) : <div className="flex justify-center py-16"><div className="spin" aria-label="Loading" /></div>}
+        </div>
+      </>
+    );
+  }
+
+  const { event } = data;
+  const setTab = (t) => go(`m/${id}/${t}`);
+  const nav = [
+    { id: "dashboard", label: "Live dashboard", icon: LayoutDashboard },
+    { id: "scanner", label: "Gate scanner", icon: ScanLine },
+    { id: "analytics", label: "Analytics", icon: BarChart3 },
+    { id: "tickets", label: "Test tickets", icon: QrIcon },
+    { id: "settings", label: "Invite & settings", icon: Settings },
+  ];
+  const live = now >= new Date(data.opens.getTime() - 3600000) && now <= data.ends;
+  const status = now > data.ends ? <><span className="dot" style={{ background: "var(--faint)" }} /> Ended {fmtDateShort(data.ends)}</>
+    : live ? <><span className="dot" style={{ background: "var(--ok)" }} /> Check-in open<span className="faint font-normal">, now {fmtTime(now)}</span></>
+    : <><Clock size={15} /> Starts {fmtDateShort(data.opens)}, {fmtTime(data.opens)}</>;
+
+  return (
+    <div className="flex min-h-screen">
+      {!gateMode && (
+        <aside className="rail hidden md:flex flex-col w-60 shrink-0 p-4 gap-6">
+          <div className="flex items-center gap-3 px-1 pt-1">
+            <Mark />
+            <div>
+              <div className="text-lg font-bold" style={{ letterSpacing: "0.02em" }}>SELAE</div>
+              <div className="text-xs faint">Event check-in</div>
+            </div>
+          </div>
+          <button className="navbtn" onClick={() => go("")}><ArrowLeft size={18} /> All events</button>
+          <nav className="flex flex-col gap-1" aria-label="Manage event">
+            {nav.map((n) => (
+              <button key={n.id} className="navbtn" aria-current={tab === n.id ? "page" : undefined} onClick={() => setTab(n.id)}>
+                <n.icon size={18} /> {n.label}
+              </button>
+            ))}
+          </nav>
+          <div className="mt-auto text-sm px-1 flex flex-col gap-1">
+            <div className="faint">Current event</div>
+            <div className="font-bold">{event.title}</div>
+            <div className="muted">{event.venue}</div>
+            <button className="navbtn mt-1" style={{ padding: ".4rem 0" }} onClick={() => go(`e/${id}`)}><ExternalLink size={15} /> Public page</button>
+          </div>
+        </aside>
+      )}
+
+      <main className="flex-1 min-w-0">
         {!gateMode && (
-          <aside className="rail hidden md:flex flex-col w-60 shrink-0 p-4 gap-6">
-            <div className="flex items-center gap-3 px-1 pt-1">
-              <div className="mark" aria-hidden="true" />
-              <div>
-                <div className="text-lg font-bold" style={{ letterSpacing: "0.02em" }}>SELAE</div>
-                <div className="text-xs faint">Event check-in</div>
+          <header className="px-4 md:px-6 pt-5 pb-3 flex flex-col gap-3" style={{ borderBottom: "1px solid var(--line)" }}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h1 className="text-xl md:text-2xl font-bold">{event.title}</h1>
+                <p className="muted text-sm">{event.venue}, {fmtDate(data.opens, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p>
+              </div>
+              <div className="flex items-center gap-2 text-sm font-bold">
+                {error && <span className="chip" style={{ color: "var(--warn)", borderColor: "#7F5424" }}><WifiOff size={13} /> Reconnecting</span>}
+                {status}
               </div>
             </div>
-            <nav className="flex flex-col gap-1" aria-label="Main">
+            <nav className="mnav flex md:hidden" aria-label="Manage event">
+              <button className="navbtn" onClick={() => go("")}><ArrowLeft size={16} /> Events</button>
               {nav.map((n) => (
-                <button key={n.id} className="navbtn" aria-current={view === n.id ? "page" : undefined} onClick={() => setView(n.id)}>
-                  <n.icon size={18} /> {n.label}
+                <button key={n.id} className="navbtn" aria-current={tab === n.id ? "page" : undefined} onClick={() => setTab(n.id)}>
+                  <n.icon size={16} /> {n.label}
                 </button>
               ))}
             </nav>
-            <div className="mt-auto text-sm px-1">
-              <div className="faint">Current event</div>
-              <div className="font-bold">{EVENT.title}</div>
-              <div className="muted">{EVENT.venue}</div>
-            </div>
-          </aside>
+          </header>
         )}
-
-        <main className="flex-1 min-w-0">
-          {!gateMode && (
-            <header className="px-4 md:px-6 pt-5 pb-3 flex flex-col gap-3" style={{ borderBottom: "1px solid var(--line)" }}>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h1 className="text-xl md:text-2xl font-bold">{EVENT.title}</h1>
-                  <p className="muted text-sm">{EVENT.venue}, {EVENT.date}</p>
-                </div>
-                <div className="flex items-center gap-2 text-sm font-bold">
-                  <span className="dot" style={{ background: "var(--ok)" }} />
-                  <span>Check-in open since {fmtTime(BASE)}<span className="faint font-normal">, now {fmtTime(now)}</span></span>
-                </div>
-              </div>
-              <nav className="mnav flex md:hidden" aria-label="Main">
-                {nav.map((n) => (
-                  <button key={n.id} className="navbtn" aria-current={view === n.id ? "page" : undefined} onClick={() => setView(n.id)}>
-                    <n.icon size={16} /> {n.label}
-                  </button>
-                ))}
-              </nav>
-            </header>
-          )}
-          <div className={gateMode ? "p-3 md:p-5" : "p-4 md:p-6"}>
-            {view === "dashboard" && <Dashboard data={data} onOpenScanner={() => setView("scanner")} />}
-            {view === "scanner" && <Scanner data={data} actions={actions} gateMode={gateMode} setGateMode={setGateMode} />}
-            {view === "analytics" && <Analytics data={data} onToast={setToast} />}
-            {view === "testids" && <TestIds seed={seed} onOpenScanner={() => setView("scanner")} />}
-          </div>
-        </main>
-      </div>
+        <div className={gateMode ? "p-3 md:p-5" : "p-4 md:p-6"}>
+          {tab === "dashboard" && <Dashboard data={data} now={now} refresh={refresh} onToast={setToast} onOpen={setTab} />}
+          {tab === "scanner" && <Scanner data={data} eventId={id} refresh={refresh} gateMode={gateMode} setGateMode={setGateMode} />}
+          {tab === "analytics" && <Analytics data={data} now={now} onToast={setToast} />}
+          {tab === "tickets" && <TestTickets data={data} eventId={id} onOpenScanner={() => setTab("scanner")} />}
+          {tab === "settings" && <SettingsPage data={data} eventId={id} refresh={refresh} />}
+        </div>
+      </main>
       {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );
 }
 
-/* ---------------- dashboard ---------------- */
-function arrivalBuckets(checkins, now, size = 5) {
-  const n = Math.max(1, Math.ceil((now - BASE) / (size * 60000)));
-  const arr = Array.from({ length: n }, (_, i) => ({ label: fmtTime(new Date(BASE.getTime() + i * size * 60000)), count: 0 }));
-  for (const c of checkins.values()) {
-    const i = Math.floor((c.time - BASE) / (size * 60000));
-    if (i >= 0 && i < n) arr[i].count++;
-  }
-  return arr;
+/* ---------------- share / invite ---------------- */
+function useShareBase() {
+  const [base, setBase] = useState(window.location.origin);
+  const [lan, setLan] = useState(null);
+  useEffect(() => {
+    api.info().then((i) => {
+      // On the server laptop, localhost links won't open on phones: use the Wi-Fi address instead
+      if (i.isLocal && i.lanUrls.length) { setBase(i.lanUrls[0]); setLan(true); } else setLan(!i.isLocal);
+    }).catch(() => setLan(false));
+  }, []);
+  return { base, lan };
 }
+
+function CopyRow({ value }) {
+  const [done, setDone] = useState(false);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(value); } catch {
+      const t = document.createElement("textarea"); t.value = value; document.body.appendChild(t); t.select();
+      try { document.execCommand("copy"); } catch { /* ignore */ } t.remove();
+    }
+    setDone(true); setTimeout(() => setDone(false), 1800);
+  };
+  return (
+    <div className="copyrow">
+      <input className="inp" readOnly value={value} onFocus={(e) => e.target.select()} aria-label="Link" />
+      <button className="btn" onClick={copy}><Copy size={16} /> {done ? "Copied" : "Copy"}</button>
+    </div>
+  );
+}
+
+function ShareCard({ eventId }) {
+  const { base, lan } = useShareBase();
+  const url = `${base}/#/e/${eventId}`;
+  return (
+    <section className="panel p-5 flex flex-col sm:flex-row gap-5 items-center">
+      <QrCode value={url} size={170} label="QR code for the registration page" />
+      <div className="flex flex-col gap-3 min-w-0 flex-1 w-full">
+        <div>
+          <h2 className="font-bold text-lg">Invite people to register</h2>
+          <p className="muted text-sm">Put this QR code on a poster or slide, or send the link in your group chat. It opens the registration page on their phone.</p>
+        </div>
+        <CopyRow value={url} />
+        {lan === false && base.includes("localhost") && (
+          <p className="text-sm" style={{ color: "var(--warn)" }}>This laptop isn't on a network, so phones can't open this link yet. Connect to Wi-Fi and reload.</p>
+        )}
+        {lan && <p className="text-sm faint">Phones need to be on the same Wi-Fi as the laptop running SELAE.</p>}
+      </div>
+    </section>
+  );
+}
+
+function SettingsPage({ data, eventId, refresh }) {
+  const key = hostKeys.all()[eventId];
+  const { base } = useShareBase();
+  return (
+    <div className="flex flex-col gap-6" style={{ maxWidth: 860 }}>
+      <ShareCard eventId={eventId} />
+      {key && (
+        <section className="panel p-5 flex flex-col gap-3">
+          <div>
+            <h2 className="font-bold text-lg">Co-host link</h2>
+            <p className="muted text-sm">Anyone who opens this can run the dashboard and gate scanner for this event. Share it only with your organizers.</p>
+          </div>
+          <CopyRow value={`${base}/#/host/${eventId}/${key}`} />
+        </section>
+      )}
+      <section className="panel p-5 flex flex-col gap-4">
+        <h2 className="font-bold text-lg">Event details</h2>
+        <EventForm key={data.event.id} initial={data.event} submitLabel="Save changes" showRegistrationToggle
+          onSubmit={async (fields) => { await api.update(eventId, fields); await refresh(); }} />
+      </section>
+    </div>
+  );
+}
+
+/* ---------------- dashboard ---------------- */
+function arrivalBuckets(checkins, now, opens, ends) {
+  const times = [...checkins.values()].map((c) => c.time.getTime());
+  let start = times.length ? Math.min(opens.getTime(), ...times) : opens.getTime();
+  let end = Math.min(now.getTime(), ends.getTime());
+  if (times.length) end = Math.max(end, Math.max(...times) + 1);
+  if (end <= start) return { size: 5, buckets: [] };
+  const span = (end - start) / 60000;
+  const size = [5, 10, 15, 30, 60, 120, 240, 1440].find((s) => span / s <= 30) || 1440;
+  start = Math.floor(start / (size * 60000)) * size * 60000;
+  const n = Math.max(1, Math.ceil((end - start) / (size * 60000)));
+  const buckets = Array.from({ length: n }, (_, i) => {
+    const t = new Date(start + i * size * 60000);
+    return { label: size >= 1440 ? fmtDateShort(t) : fmtTime(t), count: 0 };
+  });
+  for (const t of times) {
+    const i = Math.floor((t - start) / (size * 60000));
+    if (i >= 0 && i < n) buckets[i].count++;
+  }
+  return { size, buckets };
+}
+const everyLabel = (size) => (size >= 1440 ? "per day" : size >= 60 ? `every ${size / 60} hour${size > 60 ? "s" : ""}` : `every ${size} minutes`);
 
 const chartTip = { background: "#1A2C55", border: "1px solid #263A69", borderRadius: 10, color: "#EAF0FB" };
 
 function MethodChip({ method, confidence }) {
   if (!method) return null;
-  const conf = method === "ocr" || method === "confirmed" ? ` ${pct(confidence)}` : "";
+  const conf = (method === "ocr" || method === "confirmed") && confidence != null ? ` ${pct(confidence)}` : "";
   return <span className={`chip ${method}`} title={METHOD_LABEL[method]}>{METHOD_SHORT[method]}{conf}</span>;
 }
 
 function OutcomeIcon({ outcome }) {
   const map = {
     approved: [CheckCircle2, "var(--ok)"], notreg: [XCircle, "#FF7B7D"], dup: [History, "#8FB0FF"],
-    full: [Ban, "#FF7B7D"], unresolved: [HelpCircle, "var(--warn)"],
+    full: [Ban, "#FF7B7D"], unresolved: [HelpCircle, "var(--warn)"], waitlist: [Clock, "var(--warn)"], wrongevent: [CalendarX, "#FF7B7D"],
   };
   const [Icon, color] = map[outcome] || map.unresolved;
   return <Icon size={20} color={color} aria-label={OUTCOME_LABEL[outcome]} />;
 }
 
-function Dashboard({ data, onOpenScanner }) {
-  const { students, registered, checkins, log, now, byId } = data;
+function Dashboard({ data, now, refresh, onToast, onOpen }) {
+  const { students, registered, checkins, log, student, capacity, opens, ends, waitlist, event } = data;
   const [filter, setFilter] = useState("all");
   const [q, setQ] = useState("");
   const count = checkins.size;
-  const fill = count / CAPACITY;
+  const fill = count / capacity;
   const fillColor = fill >= 1 ? "var(--bad)" : fill >= 0.9 ? "var(--warn)" : "var(--ok)";
   const last10 = [...checkins.values()].filter((c) => now - c.time <= 10 * 60000).length;
   const attention = log.filter((l) => l.outcome !== "approved");
-  const buckets = useMemo(() => arrivalBuckets(checkins, now), [checkins, now]);
+  const { size, buckets } = useMemo(() => arrivalBuckets(checkins, now, opens, ends), [checkins, now, opens, ends]);
+  const notYet = Math.max(0, registered.size - [...registered].filter((sid) => checkins.has(sid)).length);
 
   const rows = useMemo(() => {
     const n = norm(q);
-    return students
-      .filter((s) => registered.has(s.id))
+    const base = filter === "waitlist" ? waitlist.map((r) => ({ ...student(r.studentId), reg: r })) : students.map((s) => ({ ...s }));
+    return base
       .filter((s) => (filter === "in" ? checkins.has(s.id) : filter === "out" ? !checkins.has(s.id) : true))
       .filter((s) => !n || norm(s.id).includes(n) || norm(s.last + s.first).includes(n) || norm(s.first + s.last).includes(n))
-      .sort((a, b) => formatName(a).localeCompare(formatName(b)));
-  }, [students, registered, checkins, filter, q]);
+      .sort((a, b) => (filter === "waitlist" ? 0 : formatName(a).localeCompare(formatName(b))));
+  }, [students, waitlist, student, checkins, filter, q]);
+
+  const promote = async (reg) => {
+    try { await api.promote(event.id, reg.id); await refresh(); onToast(`${formatName(student(reg.studentId))} moved to going`); }
+    catch (e) { onToast(e.message); }
+  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -500,18 +362,18 @@ function Dashboard({ data, onOpenScanner }) {
             <h2 id="cap-h" className="sr-only">Venue capacity</h2>
             <div className="flex items-baseline gap-3">
               <span className="font-bold" style={{ fontSize: "clamp(2.6rem,6vw,3.6rem)", lineHeight: 1 }}>{count}</span>
-              <span className="text-lg muted">checked in of {CAPACITY} venue capacity</span>
+              <span className="text-lg muted">checked in of {capacity} venue capacity</span>
             </div>
           </div>
-          <button className="btn btn-gold" onClick={onOpenScanner}><ScanLine size={18} /> Open gate scanner</button>
+          <button className="btn btn-gold" onClick={() => onOpen("scanner")}><ScanLine size={18} /> Open gate scanner</button>
         </div>
-        <div className="capbar" role="progressbar" aria-valuenow={count} aria-valuemin={0} aria-valuemax={CAPACITY} aria-label="Checked in versus capacity">
+        <div className="capbar" role="progressbar" aria-valuenow={count} aria-valuemin={0} aria-valuemax={capacity} aria-label="Checked in versus capacity">
           <div className="capfill" style={{ width: `${Math.min(100, fill * 100)}%`, background: fillColor }} />
-          <div className="captick" style={{ left: `${(registered.size / CAPACITY) * 100}%` }} title="Registered attendees" />
+          <div className="captick" style={{ left: `${Math.min(100, (registered.size / capacity) * 100)}%` }} title="Registered attendees" />
         </div>
         <dl className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-1">
           {[
-            ["Registered", registered.size, `${registered.size - count > 0 ? registered.size - count : 0} not yet arrived`],
+            ["Registered", registered.size, waitlist.length ? `${notYet} not yet arrived, ${waitlist.length} on waitlist` : `${notYet} not yet arrived`],
             ["Show-up so far", pct(count / registered.size), "of registered students"],
             ["Last 10 minutes", `+${last10}`, "new check-ins"],
             ["Needs attention", attention.length, "unregistered, repeat, or unreadable scans"],
@@ -525,31 +387,38 @@ function Dashboard({ data, onOpenScanner }) {
         </dl>
       </section>
 
+      {registered.size === 0 && waitlist.length === 0 && <ShareCard eventId={event.id} />}
+
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 flex flex-col gap-6 min-w-0">
           <section className="panel p-4 md:p-5">
             <div className="flex items-center justify-between mb-3">
-              <h2 className="font-bold text-lg">Arrivals every 5 minutes</h2>
-              <span className="text-sm faint">Since {fmtTime(BASE)}</span>
+              <h2 className="font-bold text-lg">Arrivals {everyLabel(size)}</h2>
+              <span className="text-sm faint">{buckets.length ? `From ${buckets[0].label}` : `Opens ${fmtTime(opens)}`}</span>
             </div>
             <div style={{ height: 210 }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={buckets} margin={{ top: 6, right: 6, left: -18, bottom: 0 }}>
-                  <CartesianGrid vertical={false} stroke="#263A69" strokeDasharray="3 4" />
-                  <XAxis dataKey="label" tick={{ fill: "#A3B1D0", fontSize: 12 }} axisLine={false} tickLine={false} interval={1} />
-                  <YAxis tick={{ fill: "#7384AB", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
-                  <Tooltip cursor={{ fill: "rgba(127,162,255,.08)" }} contentStyle={chartTip} formatter={(v) => [v, "Arrivals"]} />
-                  <Bar dataKey="count" fill="#7FA2FF" radius={[5, 5, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
+              {buckets.length ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={buckets} margin={{ top: 6, right: 6, left: -18, bottom: 0 }}>
+                    <CartesianGrid vertical={false} stroke="#263A69" strokeDasharray="3 4" />
+                    <XAxis dataKey="label" tick={{ fill: "#A3B1D0", fontSize: 12 }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={18} />
+                    <YAxis tick={{ fill: "#7384AB", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                    <Tooltip cursor={{ fill: "rgba(127,162,255,.08)" }} contentStyle={chartTip} formatter={(v) => [v, "Arrivals"]} />
+                    <Bar dataKey="count" fill="#7FA2FF" radius={[5, 5, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-full flex items-center justify-center muted text-center">No arrivals yet. The chart fills in as people check in.</div>
+              )}
             </div>
           </section>
 
           <section className="panel flex flex-col min-w-0">
             <div className="p-4 md:p-5 flex flex-wrap gap-3 items-center justify-between">
-              <h2 className="font-bold text-lg">Registered attendees</h2>
-              <div className="seg" role="group" aria-label="Filter attendees">
-                {[["all", `All ${registered.size}`], ["in", `Checked in ${count}`], ["out", `Not yet ${registered.size - Math.min(count, registered.size)}`]].map(([k, l]) => (
+              <h2 className="font-bold text-lg">Guest list</h2>
+              <div className="seg" role="group" aria-label="Filter guests">
+                {[["all", `Going ${registered.size}`], ["in", `Checked in ${count}`], ["out", `Not yet ${notYet}`],
+                  ...(waitlist.length ? [["waitlist", `Waitlist ${waitlist.length}`]] : [])].map(([k, l]) => (
                   <button key={k} aria-pressed={filter === k} onClick={() => setFilter(k)}>{l}</button>
                 ))}
               </div>
@@ -561,7 +430,7 @@ function Dashboard({ data, onOpenScanner }) {
             <div style={{ maxHeight: 420, overflow: "auto", borderTop: "1px solid var(--line)" }}>
               <table className="tbl">
                 <thead>
-                  <tr><th>Name</th><th>Student number</th><th>Section</th><th>Status</th><th>Identified by</th></tr>
+                  <tr><th>Name</th><th>Student number</th><th>Section</th><th>Status</th><th>{filter === "waitlist" ? "" : "Identified by"}</th></tr>
                 </thead>
                 <tbody>
                   {rows.map((s) => {
@@ -571,13 +440,17 @@ function Dashboard({ data, onOpenScanner }) {
                         <td className="font-bold">{formatName(s)}</td>
                         <td className="muted">{s.id}</td>
                         <td className="muted">{s.section}</td>
-                        <td>{c ? <span className="chip in">In at {fmtTime(c.time)}</span> : <span className="faint">Not yet</span>}</td>
-                        <td>{c ? <MethodChip method={c.method} confidence={c.confidence} /> : null}</td>
+                        <td>{s.reg ? <span className="chip confirmed">Waitlist since {fmtDateShort(s.reg.createdAt)}</span>
+                          : c ? <span className="chip in">In at {fmtTime(c.time)}</span> : <span className="faint">Not yet</span>}</td>
+                        <td>{s.reg ? <button className="btn btn-sm" onClick={() => promote(s.reg)}>Move to going</button>
+                          : c ? <MethodChip method={c.method} confidence={c.confidence} /> : null}</td>
                       </tr>
                     );
                   })}
                   {!rows.length && (
-                    <tr><td colSpan={5} className="muted" style={{ padding: "1.5rem" }}>No registered attendee matches “{q}”. Check the spelling or try the student number.</td></tr>
+                    <tr><td colSpan={5} className="muted" style={{ padding: "1.5rem" }}>
+                      {q ? `No guest matches “${q}”. Check the spelling or try the student number.` : "Nobody here yet."}
+                    </td></tr>
                   )}
                 </tbody>
               </table>
@@ -590,19 +463,20 @@ function Dashboard({ data, onOpenScanner }) {
           <p className="text-sm faint mb-2">Newest first, including scans that didn't check anyone in.</p>
           <ul className="feed" style={{ maxHeight: 760, overflow: "auto" }}>
             {log.slice(0, 18).map((l) => {
-              const s = l.sid ? byId.get(l.sid) : null;
+              const s = l.sid ? student(l.sid) : null;
               return (
                 <li key={l.uid}>
                   <OutcomeIcon outcome={l.outcome} />
                   <div className="min-w-0">
                     <div className="font-bold truncate">{s ? formatName(s) : "Unidentified ID"}</div>
-                    <div className="text-sm muted">{OUTCOME_LABEL[l.outcome]}{s ? `, ${s.section}` : ""}</div>
+                    <div className="text-sm muted">{OUTCOME_LABEL[l.outcome]}{s && s.section ? `, ${s.section}` : ""}</div>
                     {l.outcome === "approved" && <div className="mt-1"><MethodChip method={l.method} confidence={l.confidence} /></div>}
                   </div>
                   <time className="text-sm faint">{fmtTime(l.time)}</time>
                 </li>
               );
             })}
+            {!log.length && <li style={{ display: "block" }} className="muted">No scans yet.</li>}
           </ul>
         </section>
       </div>
@@ -611,202 +485,8 @@ function Dashboard({ data, onOpenScanner }) {
 }
 
 /* ---------------- gate scanner ---------------- */
-function useBeep(enabled) {
-  const ctxRef = useRef(null);
-  return (kind) => {
-    if (!enabled) return;
-    try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      const ctx = ctxRef.current || (ctxRef.current = new Ctx());
-      const tones = kind === "ok" ? [[880, 0, 0.13]] : kind === "attention" ? [[560, 0, 0.12], [560, 0.18, 0.12]] : [[220, 0, 0.3]];
-      tones.forEach(([f, start, dur]) => {
-        const o = ctx.createOscillator();
-        const g = ctx.createGain();
-        const t = ctx.currentTime + start;
-        o.frequency.value = f;
-        g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(0.18, t + 0.01);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-        o.connect(g); g.connect(ctx.destination);
-        o.start(t); o.stop(t + dur + 0.02);
-      });
-    } catch (e) { /* audio unavailable */ }
-  };
-}
-
-function HoldToExit({ onExit }) {
-  const [p, setP] = useState(0);
-  const raf = useRef(0);
-  const begin = () => {
-    const start = performance.now();
-    const step = (t) => {
-      const v = Math.min(1, (t - start) / 1200);
-      setP(v);
-      if (v >= 1) { setP(0); onExit(); return; }
-      raf.current = requestAnimationFrame(step);
-    };
-    raf.current = requestAnimationFrame(step);
-  };
-  const cancel = () => { cancelAnimationFrame(raf.current); setP(0); };
-  useEffect(() => () => cancelAnimationFrame(raf.current), []);
-  return (
-    <button className="btn btn-sm hold" onPointerDown={begin} onPointerUp={cancel} onPointerLeave={cancel}
-      onKeyDown={(e) => { if ((e.key === "Enter" || e.key === " ") && !e.repeat) { e.preventDefault(); begin(); } }}
-      onKeyUp={cancel} aria-label="Hold to exit gate mode">
-      <span className="fill" style={{ width: `${p * 100}%` }} />
-      <Lock size={15} /> <span style={{ position: "relative" }}>Hold to exit gate mode</span>
-    </button>
-  );
-}
-
-
-/* ---------------- live camera ---------------- */
-/* Opens the webcam and shows the feed. It does not decode anything yet:
-   identification still runs through the demo scenarios below. */
-function useCamera(enabled, deviceId) {
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const [state, setState] = useState("off"); // off | starting | live | denied | notfound | insecure | error
-  const [detail, setDetail] = useState("");
-  const [devices, setDevices] = useState([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const stop = () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
-      if (videoRef.current) videoRef.current.srcObject = null;
-    };
-
-    if (!enabled) { stop(); setState("off"); return; }
-
-    if (typeof navigator === "undefined" || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      // getUserMedia only exists on https or localhost
-      setState("insecure");
-      return;
-    }
-
-    setState("starting");
-    const constraints = {
-      audio: false,
-      video: deviceId
-        ? { deviceId: { exact: deviceId } }
-        : { width: { ideal: 1280 }, height: { ideal: 720 } },
-    };
-
-    navigator.mediaDevices.getUserMedia(constraints)
-      .then(async (stream) => {
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          try { await videoRef.current.play(); } catch (e) { /* autoplay guard */ }
-        }
-        setState("live");
-        setDetail("");
-        try {
-          const list = await navigator.mediaDevices.enumerateDevices();
-          if (!cancelled) setDevices(list.filter((d) => d.kind === "videoinput"));
-        } catch (e) { /* labels need permission; ignore */ }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        const name = err && err.name;
-        if (name === "NotAllowedError" || name === "SecurityError") setState("denied");
-        else if (name === "NotFoundError" || name === "DevicesNotFoundError") setState("notfound");
-        else if (name === "NotReadableError" || name === "TrackStartError") setState("error");
-        else if (name === "OverconstrainedError") setState("notfound");
-        else setState("error");
-        setDetail((err && err.message) || String(err));
-      });
-
-    return () => { cancelled = true; stop(); };
-  }, [enabled, deviceId]);
-
-  const freeze = () => { if (videoRef.current) videoRef.current.pause(); };
-  const resume = () => { if (videoRef.current && videoRef.current.paused) videoRef.current.play().catch(() => {}); };
-
-  return { videoRef, state, detail, devices, freeze, resume };
-}
-
-function CameraStage({ cam, phase, card, glare, onRetry, onUseIllustration }) {
-  const { videoRef, state, detail } = cam;
-  const live = state === "live";
-  const showIllustration = !live && state === "off" && card !== undefined && false; // reserved
-
-  if (state === "starting") {
-    return (
-      <div className="vf-center">
-        <div className="spin" aria-hidden="true" />
-        <div className="text-lg font-bold">Starting camera</div>
-        <p>macOS will ask for permission the first time. Choose Allow.</p>
-      </div>
-    );
-  }
-  if (state === "denied") {
-    return (
-      <div className="vf-center">
-        <CameraOff size={40} color="var(--warn)" />
-        <div className="text-lg font-bold">Camera permission blocked</div>
-        <ol>
-          <li>1. Click the camera icon in the browser address bar and allow access for this site.</li>
-          <li>2. If it still fails, open System Settings, Privacy &amp; Security, Camera, and switch your browser on.</li>
-          <li>3. Reload the page, then start the camera again.</li>
-        </ol>
-        <div className="flex gap-2">
-          <button className="btn" onClick={onRetry}><Camera size={16} /> Try again</button>
-          <button className="btn btn-ghost" onClick={onUseIllustration}>Continue without camera</button>
-        </div>
-      </div>
-    );
-  }
-  if (state === "notfound") {
-    return (
-      <div className="vf-center">
-        <CameraOff size={40} color="var(--warn)" />
-        <div className="text-lg font-bold">No camera found</div>
-        <p>Connect a webcam, or close any app already using it (Zoom, Photo Booth, Google Meet), then try again.</p>
-        <button className="btn" onClick={onRetry}><Camera size={16} /> Try again</button>
-      </div>
-    );
-  }
-  if (state === "insecure") {
-    return (
-      <div className="vf-center">
-        <CameraOff size={40} color="var(--warn)" />
-        <div className="text-lg font-bold">Camera needs a secure page</div>
-        <p>Browsers only hand over the camera on https or on localhost. Open the app at http://localhost:5173 rather than a network address.</p>
-        <button className="btn" onClick={onRetry}><Camera size={16} /> Try again</button>
-      </div>
-    );
-  }
-  if (state === "error") {
-    return (
-      <div className="vf-center">
-        <CameraOff size={40} color="var(--warn)" />
-        <div className="text-lg font-bold">Camera couldn't start</div>
-        <p>{detail || "Another application may be holding the camera."}</p>
-        <button className="btn" onClick={onRetry}><Camera size={16} /> Try again</button>
-      </div>
-    );
-  }
-  if (state === "off") {
-    return (
-      <div className="vf-center">
-        <CameraOff size={44} color="var(--warn)" />
-        <div className="text-xl font-bold">Camera off</div>
-        <p>Manual entry below still checks attendees in. Turn the camera back on when the hardware is ready.</p>
-        <button className="btn" onClick={onRetry}><Camera size={16} /> Start camera</button>
-      </div>
-    );
-  }
-  return null;
-}
-
 const SCENARIOS = [
-  ["clean", "Clean barcode read"],
+  ["clean", "Clean QR ticket read"],
   ["ocr", "Glare, OCR succeeds"],
   ["lowconf", "Glare, low-confidence OCR"],
   ["unreadable", "Unreadable ID"],
@@ -815,9 +495,46 @@ const SCENARIOS = [
   ["full", "Venue at capacity (simulated)"],
 ];
 
-function Scanner({ data, actions, gateMode, setGateMode }) {
-  const { checkins } = data;
-  const [phase, setPhase] = useState("idle"); // idle | barcode | ocr | result
+function makeActions(data) {
+  const rnd = (a) => a[Math.floor(Math.random() * a.length)];
+  const withStudent = (r) => ({ reg: r, student: data.student(r.studentId) });
+  return {
+    isRegistered: (sid) => data.registered.has(sid),
+    pickFor(kind) {
+      if (kind === "notreg") {
+        const pool = [...data.byId.values()].filter((s) => !data.regByStudent.has(s.id));
+        return pool.length ? { student: rnd(pool) } : null;
+      }
+      if (kind === "dup") {
+        const pool = data.going.filter((r) => r.checkin);
+        return pool.length ? withStudent(rnd(pool)) : null;
+      }
+      const pool = data.going.filter((r) => !r.checkin);
+      return pool.length ? withStudent(rnd(pool)) : null;
+    },
+    // Fuzzy match of an OCR read against this event's guest list
+    candidates(read) {
+      return data.going
+        .map((r) => ({ id: r.studentId, d: lev(read, r.studentId) }))
+        .sort((a, b) => a.d - b.d)
+        .slice(0, 3)
+        .map(({ id, d }, i) => ({ student: data.student(id), confidence: Math.max(0.31, 0.79 - d * 0.13 - i * 0.03 - Math.random() * 0.05) }));
+    },
+    search(q) {
+      const n = norm(q);
+      if (n.length < 2) return [];
+      return [...data.byId.values()]
+        .filter((s) => norm(s.id).includes(n) || norm(s.last + s.first).includes(n) || norm(s.first + s.last).includes(n))
+        .sort((a, b) => Number(data.registered.has(b.id)) - Number(data.registered.has(a.id)))
+        .slice(0, 6);
+    },
+  };
+}
+
+function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
+  const { checkins, capacity, event } = data;
+  const actions = useMemo(() => makeActions(data), [data]);
+  const [phase, setPhase] = useState("idle"); // idle | barcode | ocr | checking | result
   const [result, setResult] = useState(null);
   const [card, setCard] = useState(null);
   const [glare, setGlare] = useState(false);
@@ -832,53 +549,68 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
   const [active, setActive] = useState(0);
   const inputRef = useRef(null);
   const timers = useRef([]);
+  const scanToken = useRef(0); // ignores server replies for a scan that was reset in the meantime
   const beep = useBeep(sound);
 
   const clearTimers = () => { timers.current.forEach(clearTimeout); timers.current = []; };
   const later = (fn, ms) => timers.current.push(setTimeout(fn, ms));
   useEffect(() => clearTimers, []);
+  const focusManual = () => setTimeout(() => inputRef.current && inputRef.current.focus(), 50);
 
   const reset = () => {
     clearTimers();
+    scanToken.current++;
     setPhase("idle"); setResult(null); setCard(null); setGlare(false); setPath([]);
     cam.resume();
   };
 
-  // Final decision after an ID has been resolved (Logical Layer rules)
-  const decide = (student, method, confidence, opts = {}) => {
-    const ev = actions.evaluate(student.id, opts);
-    if (ev.outcome === "approved") {
-      const time = actions.commit(student.id, method, confidence);
-      setResult({ type: "approved", student, method, confidence, time });
+  const show = (r) => { setResult(r); setPath((p) => [...p, "result"]); setPhase("result"); cam.freeze(); };
+
+  // The final decision is made by the server (Logical Layer): registration, waitlist, duplicates, capacity
+  const decide = async (target, method, confidence, opts = {}) => {
+    const token = ++scanToken.current;
+    setPhase("checking");
+    let res;
+    try {
+      res = await api.checkin(eventId, { ...target, method, confidence, forceFull: Boolean(opts.forceFull) });
+    } catch (e) {
+      if (token !== scanToken.current) return;
+      show({ type: "error", message: e.message });
+      beep("error");
+      return;
+    }
+    if (token !== scanToken.current) return;
+    refresh();
+    const student = res.student;
+    if (res.outcome === "approved") {
+      show({ type: "approved", student, method, confidence, time: new Date(res.time) });
       beep("ok");
       later(reset, 3500);
+    } else if (res.outcome === "unresolved") {
+      show({ type: "unknown", read: target.ticket || target.studentId });
+      beep("error");
     } else {
-      actions.logScan({ sid: student.id, outcome: ev.outcome, method });
-      setResult({ type: ev.outcome, student, method, previous: ev.previous });
-      beep(ev.outcome === "dup" ? "attention" : "error");
-      if (ev.outcome === "dup") later(reset, 5000);
+      show({ type: res.outcome, student, method, otherEvent: res.otherEvent,
+        previous: res.previous ? { ...res.previous, time: new Date(res.previous.time) } : null });
+      beep(res.outcome === "dup" ? "attention" : "error");
+      if (res.outcome === "dup") later(reset, 5000);
     }
-    setPath((p) => [...p, "result"]);
-    setPhase("result");
-    cam.freeze();
   };
 
-  // A barcode was decoded from the live camera feed
+  // A code was decoded from the live camera feed: a SELAE QR ticket, or a student ID barcode
   const handleDecoded = (raw) => {
     clearTimers();
     setCard(null); setGlare(false); setResult(null);
     setPath(["barcode"]);
-    const id = parseStudentId(raw);
-    const student = id ? actions.student(id) : null;
-    if (student) { decide(student, "barcode", 1); return; }
-    actions.logScan({ sid: null, outcome: "unresolved", method: "barcode" });
-    setResult({ type: "unknown", read: raw.length > 40 ? raw.slice(0, 40) + "…" : raw });
-    setPath(["barcode", "result"]);
-    setPhase("result");
-    cam.freeze();
+    const text = raw.trim();
+    if (TICKET_RE.test(text)) { decide({ ticket: text }, "qr", 1); return; }
+    const id = parseStudentId(text);
+    if (id) { decide({ studentId: id }, "barcode", 1); return; }
+    api.logUnresolved(eventId, "barcode").then(refresh).catch(() => {});
+    show({ type: "unknown", read: text.length > 40 ? text.slice(0, 40) + "…" : text });
     beep("error");
   };
-  const engine = useBarcodeScanner({
+  const scannerStatus = useBarcodeScanner({
     videoRef: cam.videoRef,
     running: live,
     ready: phase === "idle" && !result,
@@ -888,32 +620,42 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
   const run = (kind) => {
     if (!cameraUsable) return;
     reset();
-    const student = actions.pickFor(kind);
+    const pick = actions.pickFor(kind);
+    if (!pick) {
+      setResult({ type: "error", message: kind === "dup" ? "Nobody has checked in yet, so there's no one to scan twice."
+        : kind === "notreg" ? "Every student on file is registered for this event."
+        : "Everyone on the guest list has already checked in." });
+      setPhase("result");
+      return;
+    }
+    const { student, reg } = pick;
     const needsOcr = ["ocr", "lowconf", "unreadable"].includes(kind);
     setCard(student);
     setGlare(needsOcr);
     setPhase("barcode");
     setPath(["barcode"]);
     if (!needsOcr) {
-      later(() => decide(student, "barcode", 1, { forceFull: kind === "full" }), 900);
+      later(() => (reg && (kind === "clean" || kind === "dup")
+        ? decide({ ticket: `SELAE1:${eventId}:${reg.code}` }, "qr", 1)
+        : decide({ studentId: student.id }, "barcode", 1, { forceFull: kind === "full" })), 900);
       return;
     }
     later(() => { setPhase("ocr"); setPath(["barcode", "ocr"]); }, 1100);
     later(() => {
       setPath(["barcode", "ocr", "match"]);
       if (kind === "ocr") {
-        decide(student, "ocr", 0.9 + Math.random() * 0.08);
+        decide({ studentId: student.id }, "ocr", 0.9 + Math.random() * 0.08);
       } else if (kind === "lowconf") {
         const read = misread(student.id);
         setResult({ type: "confirm", read, candidates: actions.candidates(read) });
         setPhase("result");
         beep("attention");
       } else {
-        actions.logScan({ sid: null, outcome: "unresolved", method: "ocr" });
+        api.logUnresolved(eventId, "ocr").then(refresh).catch(() => {});
         setResult({ type: "unresolved" });
         setPhase("result");
         beep("error");
-        setTimeout(() => inputRef.current && inputRef.current.focus(), 50);
+        focusManual();
       }
     }, 2400);
   };
@@ -924,10 +666,10 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
     setQ("");
     setCard(null);
     setPath(["manual"]);
-    decide(s, "manual", null);
+    decide({ studentId: s.id }, "manual", null);
   };
 
-  const busy = phase === "barcode" || phase === "ocr";
+  const busy = phase === "barcode" || phase === "ocr" || phase === "checking";
   const count = checkins.size;
 
   const stepState = (id) => {
@@ -942,12 +684,12 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
       {/* Gate header: event context and live headcount stay visible */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-4">
-          {gateMode && <div className="mark" aria-hidden="true" />}
+          {gateMode && <Mark />}
           <div>
-            <div className="text-sm muted">{gateMode ? EVENT.title : "Gate scanner"}</div>
+            <div className="text-sm muted">{gateMode ? event.title : "Gate scanner"}</div>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl font-bold">{count}</span>
-              <span className="muted">of {CAPACITY} checked in</span>
+              <span className="muted">of {capacity} checked in</span>
             </div>
           </div>
         </div>
@@ -981,15 +723,15 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
             {live ? (
               <>
                 <div className="vf-status">
-                  <span className="dot" style={{ background: engine === "error" ? "var(--warn)" : "var(--ok)" }} />
-                  {engine === "ready" ? "Scanning for barcodes" : engine === "error" ? "Barcode reader failed to load, use manual entry" : "Camera live, loading barcode reader"}
+                  <span className="dot" style={{ background: scannerStatus === "error" ? "var(--warn)" : "var(--ok)" }} />
+                  {scannerStatus === "ready" ? "Scanning for QR tickets and ID barcodes" : scannerStatus === "error" ? "Code reader failed to load, use manual entry" : "Camera live, loading code reader"}
                 </div>
                 <div className="frame" aria-hidden="true">
                   <span className="corner tl" /><span className="corner tr" /><span className="corner bl" /><span className="corner br" />
                   {phase === "barcode" && <div className="sweep" />}
                 </div>
                 {phase === "ocr" && <div className="ocr-tag">Reading the printed student number</div>}
-                {phase === "idle" && <div className="vf-note">Hold the ID barcode inside the frame. If it doesn't read, move it closer.</div>}
+                {phase === "idle" && <div className="vf-note">Hold the QR ticket or ID barcode inside the frame. If it doesn't read, move it closer.</div>}
                 {phase === "result" && <div className="vf-note">Frame held</div>}
               </>
             ) : cameraOn && cam.state !== "starting" ? (
@@ -1022,21 +764,20 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
               <CameraStage cam={cam} onRetry={() => { setCameraOn(true); }} onUseIllustration={() => setCameraOn(false)} />
             )}
           </div>
-
         </div>
 
         {/* Result panel: sits right under the camera on small screens */}
         <div className="lg:col-span-2 lg:row-span-2 min-w-0" aria-live="assertive">
-          <ResultPanel phase={phase} result={result} camera={cameraUsable} live={live} onReset={reset}
-            onConfirm={(c) => decide(c.student, "confirmed", c.confidence)}
-            onNone={() => { actions.logScan({ sid: null, outcome: "unresolved", method: "ocr" }); reset(); setTimeout(() => inputRef.current && inputRef.current.focus(), 50); }}
-            onManual={() => { reset(); setTimeout(() => inputRef.current && inputRef.current.focus(), 50); }} />
+          <ResultPanel phase={phase} result={result} camera={cameraUsable} live={live} capacity={capacity} onReset={reset}
+            onConfirm={(c) => decide({ studentId: c.student.id }, "confirmed", c.confidence)}
+            onNone={() => { api.logUnresolved(eventId, "ocr").then(refresh).catch(() => {}); reset(); focusManual(); }}
+            onManual={() => { reset(); focusManual(); }} />
         </div>
 
         {/* Pipeline + manual entry */}
         <div className="lg:col-span-3 flex flex-col gap-4 min-w-0">
           <ol className="steps" aria-label="Identification steps">
-            {[["barcode", "Barcode"], ["ocr", "Student number (OCR)"], ["match", "Fuzzy match"], ["result", "Result"]].map(([id, label]) => (
+            {[["barcode", "QR / barcode"], ["ocr", "Student number (OCR)"], ["match", "Fuzzy match"], ["result", "Result"]].map(([id, label]) => (
               <li key={id} className={`step ${stepState(id)}`}>{label}</li>
             ))}
           </ol>
@@ -1082,12 +823,14 @@ function Scanner({ data, actions, gateMode, setGateMode }) {
   );
 }
 
-function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, onManual }) {
-  if (phase === "barcode" || phase === "ocr") {
+function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm, onNone, onManual }) {
+  if (phase === "barcode" || phase === "ocr" || phase === "checking") {
+    const title = phase === "checking" ? "Checking the guest list" : phase === "barcode" ? "Reading code" : "Barcode unreadable";
+    const text = phase === "checking" ? "One moment." : phase === "barcode" ? "Keep it steady inside the frame." : "Reading the printed student number instead. Keep the ID still.";
     return (
       <div className="result idle">
-        <div className="state"><ScanLine size={24} color="var(--gold)" /> {phase === "barcode" ? "Reading barcode" : "Barcode unreadable"}</div>
-        <p className="muted text-lg">{phase === "barcode" ? "Keep the ID steady inside the frame." : "Reading the printed student number instead. Keep the ID still."}</p>
+        <div className="state"><ScanLine size={24} color="var(--gold)" /> {title}</div>
+        <p className="muted text-lg">{text}</p>
       </div>
     );
   }
@@ -1097,8 +840,8 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
         <div className="state">{camera ? <ScanLine size={24} color="var(--gold)" /> : <AlertTriangle size={24} color="var(--warn)" />} {camera ? "Ready for the next attendee" : "Scanning paused"}</div>
         <p className="muted text-lg">{camera
           ? (live
-            ? "Camera is live. Ask the attendee to hold the barcode on their student ID inside the frame. It checks in as soon as the code is read. The OCR fallback is still simulated, so use the demo scenarios for that path."
-            : "Ask the attendee to hold their student ID inside the frame. If the barcode can't be read, SELAE reads the printed student number.")
+            ? "Camera is live. Ask the attendee to show their QR ticket, or the barcode on their student ID, inside the frame. It checks in as soon as the code is read. The OCR fallback is still simulated, so use the demo scenarios for that path."
+            : "Ask the attendee to show their QR ticket or student ID inside the frame. If the code can't be read, SELAE reads the printed student number.")
           : "The camera is off. Use manual entry to keep checking attendees in."}</p>
       </div>
     );
@@ -1107,7 +850,7 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
   const Meta = ({ s }) => (
     <dl className="meta">
       <dt>Student number</dt><dd className="font-bold">{s.id}</dd>
-      <dt>Section</dt><dd className="font-bold">{s.section}</dd>
+      <dt>Section</dt><dd className="font-bold">{s.section || "Not on file"}</dd>
     </dl>
   );
 
@@ -1119,7 +862,8 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
           <div className="who">{formatName(result.student)}</div>
           <Meta s={result.student} />
           <p className="font-bold">
-            {result.method === "barcode" && "Identified by barcode"}
+            {result.method === "qr" && "Identified by QR ticket"}
+            {result.method === "barcode" && "Identified by ID barcode"}
             {result.method === "ocr" && `Identified by OCR, ${pct(result.confidence)} match`}
             {result.method === "confirmed" && `Confirmed by operator, ${pct(result.confidence)} match`}
             {result.method === "manual" && "Entered manually"}
@@ -1144,7 +888,28 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
           <div className="state"><XCircle size={28} /> Not registered for this event</div>
           <div className="who">{formatName(result.student)}</div>
           <Meta s={result.student} />
-          <p className="font-bold">This student isn't on the registration list. Send them to the registration desk.</p>
+          <p className="font-bold">This student isn't on the guest list. They can register on their phone from the event page, if spots are left.</p>
+          <button className="btn btn-on mt-auto" onClick={onReset} autoFocus>Next attendee</button>
+        </div>
+      );
+    case "waitlist":
+      return (
+        <div className="result bad">
+          <div className="state"><Clock size={28} /> On the waitlist</div>
+          <div className="who">{formatName(result.student)}</div>
+          <Meta s={result.student} />
+          <p className="font-bold">This guest registered after the event filled up and hasn't been given a spot. An organizer can move them to going from the dashboard.</p>
+          <button className="btn btn-on mt-auto" onClick={onReset} autoFocus>Next attendee</button>
+        </div>
+      );
+    case "wrongevent":
+      return (
+        <div className="result bad">
+          <div className="state"><CalendarX size={28} /> Ticket for a different event</div>
+          <div className="who">{result.student ? formatName(result.student) : "Unknown guest"}</div>
+          <p className="font-bold">
+            This QR ticket is for {result.otherEvent ? `“${result.otherEvent.title}” on ${fmtDateShort(result.otherEvent.startsAt)}` : "another event"}, not this one.
+          </p>
           <button className="btn btn-on mt-auto" onClick={onReset} autoFocus>Next attendee</button>
         </div>
       );
@@ -1154,7 +919,7 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
           <div className="state"><Ban size={28} /> Venue at capacity</div>
           <div className="who">{formatName(result.student)}</div>
           <Meta s={result.student} />
-          <p className="font-bold">The venue has reached its {CAPACITY}-person limit. Hold entry and notify an organizer before admitting anyone else.</p>
+          <p className="font-bold">The venue has reached its {capacity}-person limit. Hold entry and notify an organizer before admitting anyone else.</p>
           <button className="btn btn-on mt-auto" onClick={onReset} autoFocus>Next attendee</button>
         </div>
       );
@@ -1180,12 +945,20 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
     case "unknown":
       return (
         <div className="result warn">
-          <div className="state"><HelpCircle size={28} /> No student with this number</div>
-          <p className="text-lg">The barcode read <strong style={{ wordBreak: "break-all" }}>{result.read}</strong>, but it doesn't match any student number on file. Check the ID, then type the number or name in manual entry.</p>
+          <div className="state"><HelpCircle size={28} /> Not a ticket for this system</div>
+          <p className="text-lg">The code read <strong style={{ wordBreak: "break-all" }}>{result.read}</strong>, but it isn't a SELAE ticket or a student number on file. Check the ticket, then type the student number or name in manual entry.</p>
           <div className="flex flex-col gap-2 mt-auto">
             <button className="btn btn-on" onClick={onManual} autoFocus><Keyboard size={16} /> Go to manual entry</button>
             <button className="btn btn-on" onClick={onReset}>Next attendee</button>
           </div>
+        </div>
+      );
+    case "error":
+      return (
+        <div className="result warn">
+          <div className="state"><WifiOff size={28} /> Couldn't check in</div>
+          <p className="text-lg">{result.message}</p>
+          <button className="btn btn-on mt-auto" onClick={onReset} autoFocus>OK</button>
         </div>
       );
     default:
@@ -1200,56 +973,54 @@ function ResultPanel({ phase, result, camera, live, onReset, onConfirm, onNone, 
 }
 
 /* ---------------- analytics ---------------- */
-const METHOD_COLOR = { barcode: "#7FA2FF", ocr: "#E4B23E", confirmed: "#F39A3D", manual: "#7384AB" };
+const METHOD_COLOR = { qr: "#7FA2FF", barcode: "#B9CBFF", ocr: "#E4B23E", confirmed: "#F39A3D", manual: "#7384AB" };
 
-function Analytics({ data, onToast }) {
-  const { students, registered, checkins, log, now } = data;
+function Analytics({ data, now, onToast }) {
+  const { students, registered, checkins, log, opens, ends, event } = data;
   const attended = checkins.size;
   const reg = registered.size;
 
   const stats = useMemo(() => {
     const times = [...checkins.values()].map((c) => c.time.getTime()).sort((a, b) => a - b);
-    let best = { count: 0, start: BASE.getTime() };
+    let best = { count: 0, start: opens.getTime() };
     for (let i = 0, j = 0; i < times.length; i++) {
       while (times[i] - times[j] >= 10 * 60000) j++;
       if (i - j + 1 > best.count) best = { count: i - j + 1, start: times[j] };
     }
-    const methods = { barcode: 0, ocr: 0, confirmed: 0, manual: 0 };
-    for (const c of checkins.values()) methods[c.method]++;
+    const methods = { qr: 0, barcode: 0, ocr: 0, confirmed: 0, manual: 0 };
+    for (const c of checkins.values()) methods[c.method] = (methods[c.method] || 0) + 1;
     let running = 0;
-    const cumulative = arrivalBuckets(checkins, now, 5).map((b) => ({ label: b.label, total: (running += b.count) }));
-    const bySection = SECTIONS.map((section) => {
-      const inSec = students.filter((s) => s.section === section && registered.has(s.id));
+    const { buckets } = arrivalBuckets(checkins, now, opens, ends);
+    const cumulative = buckets.map((b) => ({ label: b.label, total: (running += b.count) }));
+    const sections = [...new Set(students.map((s) => s.section || "No section"))].sort();
+    const bySection = sections.map((section) => {
+      const inSec = students.filter((s) => (s.section || "No section") === section);
       return { section, registered: inSec.length, attended: inSec.filter((s) => checkins.has(s.id)).length };
     });
-    const failed = {
-      notreg: log.filter((l) => l.outcome === "notreg").length,
-      dup: log.filter((l) => l.outcome === "dup").length,
-      unresolved: log.filter((l) => l.outcome === "unresolved").length,
-      full: log.filter((l) => l.outcome === "full").length,
-    };
+    const failed = {};
+    for (const k of ["notreg", "dup", "unresolved", "full", "waitlist", "wrongevent"]) failed[k] = log.filter((l) => l.outcome === k).length;
     return { best, methods, cumulative, bySection, failed };
-  }, [checkins, log, now, students, registered]);
+  }, [checkins, log, now, students, opens, ends]);
 
   const { best, methods, cumulative, bySection, failed } = stats;
   const rescued = methods.ocr + methods.confirmed;
 
   const exportCsv = () => {
     const rows = [["Name", "Student number", "Section", "Checked in at", "Identified by"]];
-    students
-      .filter((s) => checkins.has(s.id))
+    [...checkins.keys()]
+      .map((sid) => data.student(sid))
       .sort((a, b) => formatName(a).localeCompare(formatName(b)))
       .forEach((s) => {
         const c = checkins.get(s.id);
-        rows.push([formatName(s), s.id, s.section, fmtTime(c.time), METHOD_LABEL[c.method]]);
+        rows.push([formatName(s), s.id, s.section, `${fmtDateShort(c.time)} ${fmtTime(c.time)}`, METHOD_LABEL[c.method]]);
       });
     const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\r\n");
     try {
       // BOM keeps ñ intact when the file is opened in Excel
-      const url = URL.createObjectURL(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" }));
+      const url = URL.createObjectURL(new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" }));
       const a = document.createElement("a");
       a.href = url;
-      a.download = "selae-attendance.csv";
+      a.download = `selae-${event.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "event"}-attendance.csv`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -1260,6 +1031,13 @@ function Analytics({ data, onToast }) {
     }
   };
 
+  const methodKeys = Object.keys(methods).filter((k) => methods[k] > 0 || ["qr", "ocr", "manual"].includes(k));
+  const failedText = [
+    `${failed.notreg} unregistered`, `${failed.dup} repeat scans blocked`, `${failed.unresolved} unreadable`,
+    failed.waitlist ? `${failed.waitlist} on the waitlist` : "", failed.wrongevent ? `${failed.wrongevent} tickets for other events` : "",
+    failed.full ? `${failed.full} turned away at capacity` : "",
+  ].filter(Boolean).join(", ");
+
   return (
     <div className="flex flex-col gap-6">
       <section className="flex flex-wrap items-end justify-between gap-4">
@@ -1268,11 +1046,12 @@ function Analytics({ data, onToast }) {
             {attended} of {reg} registered students checked in.
           </h2>
           <p className="text-lg muted mt-2">
-            That's a {pct(attended / reg)} show-up rate. The busiest 10 minutes started at {fmtTime(new Date(best.start))}, with {best.count} arrivals.
-            Figures update live while check-in is open.
+            That's a {pct(attended / reg)} show-up rate.
+            {best.count > 1 ? ` The busiest 10 minutes started at ${fmtTime(new Date(best.start))}, with ${best.count} arrivals.` : ""}
+            {" "}Figures update live while check-in is open.
           </p>
         </div>
-        <button className="btn btn-gold" onClick={exportCsv}><Download size={18} /> Export attendance (CSV)</button>
+        <button className="btn btn-gold" onClick={exportCsv} disabled={!attended}><Download size={18} /> Export attendance (CSV)</button>
       </section>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -1280,51 +1059,50 @@ function Analytics({ data, onToast }) {
           <h3 className="font-bold text-lg">Check-ins over time</h3>
           <p className="text-sm faint mb-3">Running total against the {reg} registered students</p>
           <div style={{ height: 240 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={cumulative} margin={{ top: 10, right: 26, left: -14, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="cum" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#7FA2FF" stopOpacity={0.45} />
-                    <stop offset="100%" stopColor="#7FA2FF" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid vertical={false} stroke="#263A69" strokeDasharray="3 4" />
-                <XAxis dataKey="label" tick={{ fill: "#A3B1D0", fontSize: 12 }} axisLine={false} tickLine={false} interval={1} />
-                <YAxis domain={[0, reg]} tick={{ fill: "#7384AB", fontSize: 12 }} axisLine={false} tickLine={false} />
-                <Tooltip contentStyle={chartTip} formatter={(v) => [v, "Checked in"]} />
-                <Area type="monotone" dataKey="total" stroke="#7FA2FF" strokeWidth={2.5} fill="url(#cum)" />
-              </AreaChart>
-            </ResponsiveContainer>
+            {cumulative.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={cumulative} margin={{ top: 10, right: 26, left: -14, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="cum" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#7FA2FF" stopOpacity={0.45} />
+                      <stop offset="100%" stopColor="#7FA2FF" stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid vertical={false} stroke="#263A69" strokeDasharray="3 4" />
+                  <XAxis dataKey="label" tick={{ fill: "#A3B1D0", fontSize: 12 }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={18} />
+                  <YAxis domain={[0, Math.max(1, reg)]} tick={{ fill: "#7384AB", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                  <Tooltip contentStyle={chartTip} formatter={(v) => [v, "Checked in"]} />
+                  <Area type="monotone" dataKey="total" stroke="#7FA2FF" strokeWidth={2.5} fill="url(#cum)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : <div className="h-full flex items-center justify-center muted">No check-ins yet.</div>}
           </div>
         </section>
 
         <section className="panel p-4 md:p-5 min-w-0">
           <h3 className="font-bold text-lg">How attendees were identified</h3>
           <p className="mt-1 mb-4 muted">
-            The OCR fallback identified <strong style={{ color: "var(--text)" }}>{rescued}</strong> attendees whose barcodes couldn't be read,
+            The OCR fallback identified <strong style={{ color: "var(--text)" }}>{rescued}</strong> attendees whose codes couldn't be read,
             {" "}{pct(rescued / Math.max(1, attended))} of all check-ins.
           </p>
           <div className="flex w-full overflow-hidden" style={{ height: 22, borderRadius: 999, background: "var(--bg)" }}
-            role="img" aria-label={Object.entries(methods).map(([k, v]) => `${METHOD_LABEL[k]} ${v}`).join(", ")}>
-            {Object.entries(methods).map(([k, v]) => (
-              <div key={k} style={{ width: `${(v / Math.max(1, attended)) * 100}%`, background: METHOD_COLOR[k] }} />
+            role="img" aria-label={methodKeys.map((k) => `${METHOD_LABEL[k]} ${methods[k]}`).join(", ")}>
+            {methodKeys.map((k) => (
+              <div key={k} style={{ width: `${(methods[k] / Math.max(1, attended)) * 100}%`, background: METHOD_COLOR[k] }} />
             ))}
           </div>
           <dl className="grid grid-cols-2 gap-x-6 gap-y-3 mt-5">
-            {Object.entries(methods).map(([k, v]) => (
+            {methodKeys.map((k) => (
               <div key={k} className="flex items-center gap-3">
                 <span style={{ width: 12, height: 12, borderRadius: 3, background: METHOD_COLOR[k], flexShrink: 0 }} />
                 <dt className="muted flex-1">{METHOD_LABEL[k]}</dt>
-                <dd className="font-bold">{v}</dd>
+                <dd className="font-bold">{methods[k]}</dd>
               </div>
             ))}
           </dl>
           <div className="mt-5 pt-4 text-sm" style={{ borderTop: "1px solid var(--line)" }}>
             <div className="font-bold mb-1">Scans that didn't check anyone in</div>
-            <p className="muted">
-              {failed.notreg} unregistered, {failed.dup} repeat scans blocked, {failed.unresolved} unreadable
-              {failed.full ? `, ${failed.full} turned away at capacity` : ""}.
-            </p>
+            <p className="muted">{failedText}.</p>
           </div>
         </section>
 
@@ -1336,18 +1114,20 @@ function Analytics({ data, onToast }) {
               <span className="flex items-center gap-2"><span style={{ width: 12, height: 12, borderRadius: 3, background: "#7FA2FF" }} /> Checked in</span>
             </div>
           </div>
-          <div style={{ height: 380 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={bySection} layout="vertical" margin={{ top: 0, right: 16, left: 4, bottom: 0 }} barGap={-14} barCategoryGap="28%">
-                <CartesianGrid horizontal={false} stroke="#263A69" strokeDasharray="3 4" />
-                <XAxis type="number" tick={{ fill: "#7384AB", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
-                <YAxis type="category" dataKey="section" width={78} tick={{ fill: "#A3B1D0", fontSize: 13 }} axisLine={false} tickLine={false} />
-                <Tooltip cursor={{ fill: "rgba(127,162,255,.06)" }} contentStyle={chartTip}
-                  formatter={(v, name) => [v, name === "attended" ? "Checked in" : "Registered"]} />
-                <Bar dataKey="registered" fill="#34497D" barSize={14} radius={[0, 5, 5, 0]} />
-                <Bar dataKey="attended" fill="#7FA2FF" barSize={14} radius={[0, 5, 5, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+          <div style={{ height: Math.max(120, bySection.length * 38) }}>
+            {bySection.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={bySection} layout="vertical" margin={{ top: 0, right: 16, left: 4, bottom: 0 }} barGap={-14} barCategoryGap="28%">
+                  <CartesianGrid horizontal={false} stroke="#263A69" strokeDasharray="3 4" />
+                  <XAxis type="number" tick={{ fill: "#7384AB", fontSize: 12 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                  <YAxis type="category" dataKey="section" width={92} tick={{ fill: "#A3B1D0", fontSize: 13 }} axisLine={false} tickLine={false} />
+                  <Tooltip cursor={{ fill: "rgba(127,162,255,.06)" }} contentStyle={chartTip}
+                    formatter={(v, name) => [v, name === "attended" ? "Checked in" : "Registered"]} />
+                  <Bar dataKey="registered" fill="#34497D" barSize={14} radius={[0, 5, 5, 0]} />
+                  <Bar dataKey="attended" fill="#7FA2FF" barSize={14} radius={[0, 5, 5, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : <div className="h-full flex items-center justify-center muted">No registrations yet.</div>}
           </div>
         </section>
       </div>
@@ -1355,49 +1135,33 @@ function Analytics({ data, onToast }) {
   );
 }
 
-/* ---------------- test IDs ---------------- */
-/* Printable barcodes for students in the sample data, so the live
-   scanner can be tested and demoed without real student IDs. */
-function IdBarcode({ value }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    if (!ref.current) return;
-    try {
-      JsBarcode(ref.current, value, {
-        format: "CODE128", width: 2, height: 64, margin: 12, displayValue: true,
-        font: "Atkinson Hyperlegible, sans-serif", fontSize: 15, background: "#ffffff", lineColor: "#000000",
-      });
-    } catch { /* invalid value */ }
-  }, [value]);
-  return <svg ref={ref} role="img" aria-label={`Barcode for ${value}`} />;
-}
-
-function TestIds({ seed, onOpenScanner }) {
+/* ---------------- test tickets ---------------- */
+/* Live QR codes for guests of this event, so the scanner can be tested
+   and demoed without anyone's phone. Groups update as people check in. */
+function TestTickets({ data, eventId, onOpenScanner }) {
   const groups = useMemo(() => {
-    const { students, registered, checkins } = seed;
+    const ticket = (r) => ({ key: r.id, student: data.student(r.studentId), value: `SELAE1:${eventId}:${r.code}` });
+    const notReg = [...data.byId.values()].filter((s) => !data.regByStudent.has(s.id)).slice(0, 3);
     return [
-      { key: "ok", title: "Registered, not yet checked in", expect: "Checks in (green)",
-        list: students.filter((s) => registered.has(s.id) && !checkins.has(s.id)).slice(0, 6) },
-      { key: "dup", title: "Already checked in", expect: "Already checked in (blue)",
-        list: students.filter((s) => checkins.has(s.id)).slice(0, 3) },
-      { key: "notreg", title: "Not registered for this event", expect: "Not registered (red)",
-        list: students.filter((s) => !registered.has(s.id)).slice(0, 3) },
-    ];
-  }, [seed]);
+      { key: "ok", title: "Going, not yet checked in", expect: "Checks in (green)", list: data.going.filter((r) => !r.checkin).slice(0, 6).map(ticket) },
+      { key: "dup", title: "Already checked in", expect: "Already checked in (blue)", list: data.going.filter((r) => r.checkin).slice(0, 3).map(ticket) },
+      { key: "wait", title: "On the waitlist", expect: "On the waitlist (red)", list: data.waitlist.slice(0, 3).map(ticket) },
+      { key: "notreg", title: "Student ID only, not registered", expect: "Not registered (red)",
+        note: "These encode a student number, like the barcode on a student ID.",
+        list: notReg.map((s) => ({ key: s.id, student: s, value: s.id })) },
+    ].filter((g) => g.list.length);
+  }, [data, eventId]);
 
   return (
     <div className="flex flex-col gap-6">
       <section className="flex flex-wrap items-end justify-between gap-4 noprint">
         <div style={{ maxWidth: 720 }}>
-          <h2 className="font-bold text-2xl">Test IDs</h2>
+          <h2 className="font-bold text-2xl">Test tickets</h2>
           <p className="muted mt-1">
-            Barcodes for students in the sample data. Print this page, or open it on your phone and hold the screen up to the
-            webcam on the Gate scanner. Each group shows the result you should get the first time you scan it.
+            Real QR tickets for guests of this event. Print this page, or open it on a phone and hold the screen up to the webcam on
+            the Gate scanner. Each group shows the result you should get. The groups update as people check in.
           </p>
-          <p className="faint text-sm mt-2">
-            To open it on a phone, run <code>npm run dev -- --host</code> and visit the Network address it prints, followed by <code>/#testids</code>.
-            Turn the phone's brightness up. Glare on the screen is the most common reason a code won't read.
-          </p>
+          <p className="faint text-sm mt-2">The best test is a real one: register on your phone from the event page, then scan the ticket you get.</p>
         </div>
         <div className="flex gap-2">
           <button className="btn" onClick={() => window.print()}><Printer size={17} /> Print</button>
@@ -1405,18 +1169,20 @@ function TestIds({ seed, onOpenScanner }) {
         </div>
       </section>
 
+      {!groups.length && <p className="muted">Nobody is registered yet. Share the event page from Invite &amp; settings.</p>}
       {groups.map((g) => (
         <section key={g.key} className="flex flex-col gap-3">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <h3 className="font-bold text-lg">{g.title}</h3>
             <span className="text-sm faint">Expected: {g.expect}</span>
           </div>
+          {g.note && <p className="text-sm faint" style={{ marginTop: "-.4rem" }}>{g.note}</p>}
           <div className="testgrid">
-            {g.list.map((s) => (
-              <div key={s.id} className="testcard">
-                <div className="font-bold">{formatName(s)}</div>
-                <div className="text-sm" style={{ color: "#4A5675" }}>{s.section}</div>
-                <IdBarcode value={s.id} />
+            {g.list.map((t) => (
+              <div key={t.key} className="testcard">
+                <div className="font-bold">{formatName(t.student)}</div>
+                <div className="text-sm" style={{ color: "#4A5675" }}>{t.student.id}{t.student.section ? `, ${t.student.section}` : ""}</div>
+                <QrCode value={t.value} size={170} label={`QR code for ${formatName(t.student)}`} />
               </div>
             ))}
           </div>
