@@ -102,6 +102,7 @@ export const CSS = `
   background:radial-gradient(circle at 72% 74%, rgba(255,255,255,.97) 0%, rgba(255,255,255,.82) 16%, rgba(255,255,255,0) 42%)}
 .viewfinder video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#0a1020}
 .viewfinder video.frozen{filter:grayscale(.15) brightness(.8)}
+.vf-ocr{position:absolute;right:3%;top:3.5%;z-index:3}
 .vf-note{position:absolute;left:50%;bottom:9%;transform:translateX(-50%);background:rgba(9,18,38,.82);color:var(--text);
   font-weight:700;font-size:.82rem;padding:.3rem .7rem;border-radius:999px;white-space:nowrap}
 .vf-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.75rem;
@@ -258,12 +259,27 @@ export function lev(a, b) {
   return d[a.length][b.length];
 }
 
-// Digits OCR commonly confuses under glare
+// Simulated OCR output for the demo scenarios (the ID on screen is a drawing, so
+// there is nothing real to read). Swaps digits OCR commonly confuses under glare.
+// The read is then matched by the real matcher on the server.
 const CONFUSE = { 0: "8", 1: "7", 2: "7", 3: "8", 4: "9", 5: "6", 6: "5", 7: "1", 8: "3", 9: "4" };
-export function misread(id) {
-  const [yr, num] = id.split("-");
-  const i = Math.floor(Math.random() * num.length);
-  return `${yr}-${num.slice(0, i)}${CONFUSE[num[i]]}${num.slice(i + 1)}`;
+const rand = (a, b) => a + Math.random() * (b - a);
+export function simulateRead(id, kind, twin) {
+  const digits = id.replace(/\D/g, "").split("");
+  const conf = digits.map(() => rand(0.88, 0.99));
+  if (kind === "hard" && twin) {
+    // Smudge exactly where this guest's number differs from a look-alike guest's,
+    // so the read sits between the two (alternately looking like each one)
+    const other = twin.replace(/\D/g, "");
+    const diffs = digits.map((d, i) => (d !== other[i] ? i : -1)).filter((i) => i >= 0);
+    diffs.forEach((i, k) => { if (k % 2 === 1) digits[i] = other[i]; conf[i] = rand(0.25, 0.4); });
+  } else {
+    // One glare-damaged digit, years excluded
+    const i = 4 + Math.floor(Math.random() * 5);
+    digits[i] = CONFUSE[digits[i]];
+    conf[i] = rand(0.45, 0.7);
+  }
+  return { read: digits.join(""), conf };
 }
 
 export const METHOD_LABEL = { qr: "QR ticket", barcode: "ID barcode", ocr: "OCR", confirmed: "Operator confirmed", manual: "Manual entry" };

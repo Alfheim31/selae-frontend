@@ -7,14 +7,18 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "vite build && node server/index.js"
+    "start": "vite build && node server/index.js",
+    "test": "node --test server/matcher.test.js",
+    "eval": "node scripts/eval-matcher.js"
   },
   "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
     "lucide-react": "^1.47.0",
     "qrcode": "^1.5.4",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "recharts": "^3.10.1",
+    "tesseract.js": "^7.0.0",
     "zxing-wasm": "^3.1.5"
   },
   "devDependencies": {

@@ -27,8 +27,9 @@ internet connection is needed.
 - **Live dashboard** — headcount against capacity, arrivals over time, guest list
   with waitlist (move people to going), feed of recent scans including failures.
 - **Gate scanner** — live webcam that reads **QR tickets** and **student ID
-  barcodes**, the QR → OCR → match → result pipeline, manual entry, and a locked
-  gate mode for volunteers.
+  barcodes**. When a code won't scan, **Read printed number** reads the student
+  number off the ID with OCR, and a Bayesian matcher works out who it is (see
+  below). Manual entry, and a locked gate mode for volunteers.
 - **Analytics** — show-up rate, check-ins over time, attendance by section, how
   each attendee was identified, CSV export.
 - **Test tickets** — live QR codes for guests, to test or demo the scanner.
@@ -84,6 +85,76 @@ Events, registrations and scans are saved to `data/selae.json` on the laptop
 General Assembly, already 42 minutes into check-in. To start over, stop the server
 and delete the file. To keep a different file, set `SELAE_DATA=path/to/file.json`.
 
+## The intelligent component: OCR matching that learns
+
+When a QR ticket or ID barcode can't be read, SELAE reads the printed student
+number and decides who the attendee is. OCR under glare makes mistakes, so this
+is a decision under uncertainty, not a lookup. It works like an agent:
+
+1. **Perceives.** Tesseract (`src/ocr.js`) reads the frame inside the gold box,
+   in the browser and offline. Each frame is read up to three ways (contrast
+   stretched, glare-corrected with a local threshold, and binarized) and the
+   most number-like result kept, with Tesseract's confidence for each digit.
+2. **Knows how OCR fails.** `server/matcher.js` holds a confusion matrix,
+   P(read digit | true digit), plus chances of a dropped or extra digit. It
+   starts from general OCR knowledge (8 and 3, 1 and 7, 5 and 6 get swapped
+   far more than 1 and 0).
+3. **Reasons with Bayes' rule.** For everyone on file,
+   P(student | read) ∝ P(read | student) × P(student). The likelihood sums over
+   every alignment of the read with that student's number (forward algorithm),
+   weighting each digit by OCR's confidence in it. The prior comes from the
+   event: a registered guest who hasn't arrived is far likelier at the gate than
+   someone already inside or not registered. An "unknown person" hypothesis
+   takes the probability when the read looks like nobody on file.
+4. **Acts on a three-band policy.** At 95% or more it identifies the attendee
+   alone; from 40% it shows the operator a short list with probabilities and the
+   doubtful digits underlined; below that it sends them to manual entry. Whether
+   the person is *admitted* is still decided by the check-in rules (registered,
+   not a duplicate, under capacity).
+5. **Learns.** When the operator picks a candidate, or types the right student
+   after "none of these", the read is aligned with the true number and every
+   digit pair is counted into the confusion matrix. The matcher adapts to this
+   venue's lighting and this batch of cards. Only a person's answer is learned
+   from, never the matcher's own guesses, and an answer that looks nothing like
+   the read (a slip) is ignored.
+
+**Analytics → OCR matcher** shows how it's doing: reads decided alone or asked,
+how often the right student was ranked first, and the misreads it has learned.
+
+### Evaluating it
+
+```bash
+npm test          # unit tests for the matcher
+npm run eval      # matcher vs. plain edit distance on a simulated venue
+```
+
+`npm run eval` builds 2,000 students on file and a 300-guest event, simulates
+OCR misreading numbers at an 11% per-digit error rate with confusions the matcher
+doesn't expect at first, and compares (seed 7):
+
+| Matcher | Top-1 right | Decided alone | Wrong when alone | Asked operator |
+|---|---|---|---|---|
+| Plain edit distance (earlier prototype) | 90.8% | 60.3% | 0.3% | 39.7% |
+| Bayesian, before learning | 95.8% | 75.5% | 0.9% | 19.5% |
+| Bayesian, after 43 corrections | 98.3% | 83.8% | 1.2% | 13.7% |
+
+It also prints how the 95% threshold trades operator workload against wrong
+automatic identifications. Most of those mistakes are people who aren't on file
+at all whose number is a digit away from a guest's, which is why the approved
+screen shows the name for the volunteer to check.
+
+These numbers are from simulated reads. For the paper, photograph real IDs
+(some with glare), run them through **Read printed number**, and record each
+read and the true number in a CSV, then:
+
+```bash
+npm run eval -- --csv reads.csv --roster roster.txt
+```
+
+`reads.csv` has `read,truth[,conf]` per line (conf: per-digit confidences
+separated by spaces); `roster.txt` lists the registered student numbers. The
+first half of the reads is learned from, the second half is tested.
+
 ## Testing the scanner
 
 1. On your phone (same Wi-Fi), scan the QR code in **Invite & settings** and
@@ -97,6 +168,12 @@ and delete the file. To keep a different file, set `SELAE_DATA=path/to/file.json
 checked in, waitlisted guests, and plain student numbers that aren't registered.
 If a code doesn't read, move it closer and turn the screen brightness up.
 
+To try OCR, hold a student ID (or a card with a number like 2024-12345 printed
+on it) flat inside the gold frame and press **Read printed number**. The demo
+scenarios **Glare, OCR succeeds** and **Glare, low-confidence OCR** simulate the
+OCR output (the card on screen is a drawing), but the matching, the decision and
+the learning are real.
+
 Leaving a code in front of the camera won't check it in twice: it has to leave the
 frame for 1.5 seconds before it can be read again.
 
@@ -107,6 +184,8 @@ server/
   index.js             venue server: serves dist/ and the API (npm start)
   plugin.js            mounts the API into Vite for npm run dev / preview
   api.js               logical layer: registration, waitlist, check-in rules
+  matcher.js           intelligent component: Bayesian OCR matching and learning
+  matcher.test.js      unit tests for the matcher (npm test)
   store.js             physical layer: the JSON data file, atomic writes
   seed.js              demo event and student directory for the first run
 src/
@@ -115,8 +194,11 @@ src/
   shared.jsx           styles, formatting, QR code component
   camera.jsx           webcam access, beeps, hold-to-exit
   barcode.js           live QR / barcode decoding from the camera (zxing-cpp)
+  ocr.js               OCR of the printed student number (Tesseract), with glare correction
   api.js               client for the server API; host keys and tickets per device
   main.jsx             entry point
+scripts/
+  eval-matcher.js      evaluation: matcher vs. edit distance, threshold sweep (npm run eval)
 ```
 
 ## Stack
@@ -127,13 +209,13 @@ src/
 - zxing-wasm (zxing-cpp compiled to WebAssembly) for decoding; bundled with the
   app, so scanning works offline
 - qrcode for generating QR tickets
+- tesseract.js for OCR; its worker, engine and English model are copied into the
+  build from node_modules, so OCR also works offline
 
 ## Not built yet
 
 - Accounts and passwords; email or SMS confirmations
 - Exit scanning, so "checked in" counts arrivals, not people currently inside
-- OCR of the printed student number when a code can't be read (planned: Tess4J
-  and OpenCV in the Java build)
 - Importing a registration list
 
 ## Note for the Java build
@@ -141,3 +223,5 @@ src/
 This prototype exists to settle the interface and the rules before the Java
 version is written. JavaFX is the closest match for the organizer console, and
 the original ZXing library (`com.google.zxing`) covers QR and barcode decoding.
+Tess4J does the OCR there, and `server/matcher.js` has no dependencies, so it
+ports to Java line for line.
