@@ -3,13 +3,14 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGri
 import {
   LayoutDashboard, ScanLine, BarChart3, Search, CheckCircle2, XCircle, AlertTriangle, Camera, CameraOff,
   Volume2, VolumeX, Lock, Download, History, HelpCircle, Ban, Keyboard, Printer, QrCode as QrIcon, Settings,
-  ArrowLeft, ExternalLink, Copy, Clock, CalendarX, WifiOff,
+  ArrowLeft, ExternalLink, Copy, Clock, CalendarX, WifiOff, ScanText, Brain,
 } from "lucide-react";
 import { useBarcodeScanner, parseStudentId } from "./barcode.js";
 import { useBeep, HoldToExit, useCamera, CameraStage } from "./camera.jsx";
+import { readStudentNumber, warmUpOcr } from "./ocr.js";
 import { api, hostKeys } from "./api.js";
 import {
-  CSS, Mark, QrCode, go, useHashRoute, useToast, fmtTime, fmtDate, fmtDateShort, formatName, norm, pct, lev, misread,
+  CSS, Mark, QrCode, go, useHashRoute, useToast, fmtTime, fmtDate, fmtDateShort, formatName, norm, pct, lev, simulateRead,
   METHOD_LABEL, METHOD_SHORT, OUTCOME_LABEL,
 } from "./shared.jsx";
 import { TopBar, Discover, EventPage, TicketPage, MyTickets, CreateEvent, EventForm } from "./public.jsx";
@@ -73,6 +74,7 @@ function toData(s) {
   const checkins = new Map(regs.filter((r) => r.checkin).map((r) => [r.studentId, { ...r.checkin, time: new Date(r.checkin.time) }]));
   return {
     event: s.event,
+    matcher: s.matcher || null,
     capacity: s.event.capacity,
     opens: new Date(s.event.startsAt),
     ends: new Date(s.event.endsAt),
@@ -202,7 +204,7 @@ function Manage({ id, tab }) {
         <div className={gateMode ? "p-3 md:p-5" : "p-4 md:p-6"}>
           {tab === "dashboard" && <Dashboard data={data} now={now} refresh={refresh} onToast={setToast} onOpen={setTab} />}
           {tab === "scanner" && <Scanner data={data} eventId={id} refresh={refresh} gateMode={gateMode} setGateMode={setGateMode} />}
-          {tab === "analytics" && <Analytics data={data} now={now} onToast={setToast} />}
+          {tab === "analytics" && <Analytics data={data} now={now} onToast={setToast} refresh={refresh} />}
           {tab === "tickets" && <TestTickets data={data} eventId={id} onOpenScanner={() => setTab("scanner")} />}
           {tab === "settings" && <SettingsPage data={data} eventId={id} refresh={refresh} />}
         </div>
@@ -512,13 +514,18 @@ function makeActions(data) {
       const pool = data.going.filter((r) => !r.checkin);
       return pool.length ? withStudent(rnd(pool)) : null;
     },
-    // Fuzzy match of an OCR read against this event's guest list
-    candidates(read) {
-      return data.going
-        .map((r) => ({ id: r.studentId, d: lev(read, r.studentId) }))
-        .sort((a, b) => a.d - b.d)
-        .slice(0, 3)
-        .map(({ id, d }, i) => ({ student: data.student(id), confidence: Math.max(0.31, 0.79 - d * 0.13 - i * 0.03 - Math.random() * 0.05) }));
+    // For the "hard read" demo: a guest whose student number is closest to another guest's,
+    // the case where OCR alone genuinely can't tell two people apart
+    closestPair() {
+      const pool = data.going.filter((r) => !r.checkin).map((r) => r.studentId);
+      let best = null;
+      for (let i = 0; i < pool.length; i++)
+        for (let j = 0; j < pool.length; j++) {
+          if (i === j) continue;
+          const d = lev(pool[i], pool[j]);
+          if (!best || d < best.d || (d === best.d && Math.random() < 0.3)) best = { d, id: pool[i], twin: pool[j] };
+        }
+      return best;
     },
     search(q) {
       const n = norm(q);
@@ -550,6 +557,7 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
   const inputRef = useRef(null);
   const timers = useRef([]);
   const scanToken = useRef(0); // ignores server replies for a scan that was reset in the meantime
+  const pendingScan = useRef(null); // an OCR read nobody matched; the next manual entry tells the matcher who it was
   const beep = useBeep(sound);
 
   const clearTimers = () => { timers.current.forEach(clearTimeout); timers.current = []; };
@@ -572,7 +580,7 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
     setPhase("checking");
     let res;
     try {
-      res = await api.checkin(eventId, { ...target, method, confidence, forceFull: Boolean(opts.forceFull) });
+      res = await api.checkin(eventId, { ...target, method, confidence, forceFull: Boolean(opts.forceFull), scanId: opts.scanId || undefined });
     } catch (e) {
       if (token !== scanToken.current) return;
       show({ type: "error", message: e.message });
@@ -583,7 +591,7 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
     refresh();
     const student = res.student;
     if (res.outcome === "approved") {
-      show({ type: "approved", student, method, confidence, time: new Date(res.time) });
+      show({ type: "approved", student, method, confidence, time: new Date(res.time), learned: Boolean(opts.scanId && (method === "confirmed" || method === "manual")) });
       beep("ok");
       later(reset, 3500);
     } else if (res.outcome === "unresolved") {
@@ -600,6 +608,7 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
   // A code was decoded from the live camera feed: a SELAE QR ticket, or a student ID barcode
   const handleDecoded = (raw) => {
     clearTimers();
+    pendingScan.current = null;
     setCard(null); setGlare(false); setResult(null);
     setPath(["barcode"]);
     const text = raw.trim();
@@ -617,6 +626,70 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
     onDetect: handleDecoded,
   });
 
+  // The intelligent part: send what OCR read to the server's Bayesian matcher and act on its decision
+  const matchRead = async (read, conf, source) => {
+    const token = scanToken.current;
+    setPath((p) => [...p.filter((x) => x !== "match"), "match"]);
+    let m;
+    try {
+      m = await api.match(eventId, { read, conf, source });
+    } catch (e) {
+      if (token !== scanToken.current) return;
+      show({ type: "error", message: e.message });
+      beep("error");
+      return;
+    }
+    if (token !== scanToken.current) return;
+    const top = m.candidates[0];
+    if (m.decision === "auto") {
+      decide({ studentId: top.student.id }, "ocr", top.p, { scanId: m.scanId });
+    } else if (m.decision === "confirm") {
+      pendingScan.current = m.scanId;
+      setResult({ type: "confirm", read: m.read, candidates: m.candidates, pUnknown: m.pUnknown, scanId: m.scanId, thresholds: m.thresholds });
+      setPhase("result");
+      beep("attention");
+    } else {
+      pendingScan.current = m.scanId;
+      setResult({ type: "lowmatch", read: m.read, best: top || null, pUnknown: m.pUnknown, scanId: m.scanId });
+      setPhase("result");
+      beep("error");
+    }
+  };
+
+  // Operator pressed "Read printed number": OCR the current frame
+  const [ocrState, setOcrState] = useState("idle"); // idle | loading | error
+  useEffect(() => { if (live) warmUpOcr(); }, [live]);
+  const readPrinted = async () => {
+    if (!live || phase !== "idle" || result) return;
+    clearTimers();
+    pendingScan.current = null;
+    const token = ++scanToken.current;
+    setCard(null); setGlare(false); setResult(null);
+    setPhase("ocr"); setPath(["ocr"]);
+    cam.freeze();
+    let ocr;
+    try {
+      setOcrState("loading");
+      ocr = await readStudentNumber(cam.videoRef.current);
+      setOcrState("idle");
+    } catch (e) {
+      setOcrState("error");
+      if (token !== scanToken.current) return;
+      show({ type: "error", message: "The OCR engine couldn't start. Use manual entry, and check that the app was built with npm start." });
+      beep("error");
+      return;
+    }
+    if (token !== scanToken.current) return;
+    if (!ocr) {
+      api.logUnresolved(eventId, "ocr").then(refresh).catch(() => {});
+      setResult({ type: "unresolved", noDigits: true });
+      setPhase("result");
+      beep("error");
+      return;
+    }
+    matchRead(ocr.read, ocr.conf, "camera");
+  };
+
   const run = (kind) => {
     if (!cameraUsable) return;
     reset();
@@ -628,7 +701,12 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
       setPhase("result");
       return;
     }
-    const { student, reg } = pick;
+    let { student, reg } = pick;
+    let twin = null;
+    if (kind === "lowconf") {
+      const pair = actions.closestPair();
+      if (pair) { student = data.student(pair.id); twin = pair.twin; }
+    }
     const needsOcr = ["ocr", "lowconf", "unreadable"].includes(kind);
     setCard(student);
     setGlare(needsOcr);
@@ -642,15 +720,12 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
     }
     later(() => { setPhase("ocr"); setPath(["barcode", "ocr"]); }, 1100);
     later(() => {
-      setPath(["barcode", "ocr", "match"]);
-      if (kind === "ocr") {
-        decide({ studentId: student.id }, "ocr", 0.9 + Math.random() * 0.08);
-      } else if (kind === "lowconf") {
-        const read = misread(student.id);
-        setResult({ type: "confirm", read, candidates: actions.candidates(read) });
-        setPhase("result");
-        beep("attention");
+      if (kind === "ocr" || kind === "lowconf") {
+        // Simulated OCR output (the card on screen is a drawing), but the matching and decision are real
+        const { read, conf } = simulateRead(student.id, kind === "ocr" ? "glare" : "hard", twin);
+        matchRead(read, conf, "demo");
       } else {
+        setPath(["barcode", "ocr", "match"]);
         api.logUnresolved(eventId, "ocr").then(refresh).catch(() => {});
         setResult({ type: "unresolved" });
         setPhase("result");
@@ -666,7 +741,9 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
     setQ("");
     setCard(null);
     setPath(["manual"]);
-    decide({ studentId: s.id }, "manual", null);
+    const scanId = pendingScan.current;
+    pendingScan.current = null;
+    decide({ studentId: s.id }, "manual", null, { scanId });
   };
 
   const busy = phase === "barcode" || phase === "ocr" || phase === "checking";
@@ -731,7 +808,12 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
                   {phase === "barcode" && <div className="sweep" />}
                 </div>
                 {phase === "ocr" && <div className="ocr-tag">Reading the printed student number</div>}
-                {phase === "idle" && <div className="vf-note">Hold the QR ticket or ID barcode inside the frame. If it doesn't read, move it closer.</div>}
+                {phase === "idle" && <div className="vf-note">Hold the QR ticket or ID barcode inside the frame. If it doesn't read, press Read printed number.</div>}
+                {phase === "idle" && !result && (
+                  <button className="btn btn-sm btn-gold vf-ocr" onClick={readPrinted} title="Read the printed student number with OCR">
+                    <ScanText size={16} /> Read printed number
+                  </button>
+                )}
                 {phase === "result" && <div className="vf-note">Frame held</div>}
               </>
             ) : cameraOn && cam.state !== "starting" ? (
@@ -769,15 +851,15 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
         {/* Result panel: sits right under the camera on small screens */}
         <div className="lg:col-span-2 lg:row-span-2 min-w-0" aria-live="assertive">
           <ResultPanel phase={phase} result={result} camera={cameraUsable} live={live} capacity={capacity} onReset={reset}
-            onConfirm={(c) => decide({ studentId: c.student.id }, "confirmed", c.confidence)}
-            onNone={() => { api.logUnresolved(eventId, "ocr").then(refresh).catch(() => {}); reset(); focusManual(); }}
+            onConfirm={(c) => decide({ studentId: c.student.id }, "confirmed", c.p, { scanId: result && result.scanId })}
+            onNone={() => { api.logUnresolved(eventId, "ocr", result && result.scanId).then(refresh).catch(() => {}); reset(); focusManual(); }}
             onManual={() => { reset(); focusManual(); }} />
         </div>
 
         {/* Pipeline + manual entry */}
         <div className="lg:col-span-3 flex flex-col gap-4 min-w-0">
           <ol className="steps" aria-label="Identification steps">
-            {[["barcode", "QR / barcode"], ["ocr", "Student number (OCR)"], ["match", "Fuzzy match"], ["result", "Result"]].map(([id, label]) => (
+            {[["barcode", "QR / barcode"], ["ocr", "Student number (OCR)"], ["match", "Bayesian match"], ["result", "Result"]].map(([id, label]) => (
               <li key={id} className={`step ${stepState(id)}`}>{label}</li>
             ))}
           </ol>
@@ -823,6 +905,26 @@ function Scanner({ data, eventId, refresh, gateMode, setGateMode }) {
   );
 }
 
+// Posteriors very close to 1 would round to "100%", which overstates certainty
+const sure = (p) => (p >= 0.995 ? "over 99%" : pct(p));
+const STATUS_NOTE = { inside: "Already checked in", waitlist: "On the waitlist", notreg: "Not registered for this event" };
+
+/** A candidate's student number with the digits that differ from the OCR read underlined. */
+function DigitDiff({ id, read }) {
+  const a = id.replace(/\D/g, ""), b = String(read).replace(/\D/g, "");
+  if (a.length !== b.length) return <span>{id}</span>;
+  let k = 0;
+  return (
+    <span>
+      {id.split("").map((ch, i) => {
+        if (!/\d/.test(ch)) return <span key={i}>{ch}</span>;
+        const differs = ch !== b[k++];
+        return differs ? <u key={i} style={{ textDecorationThickness: 2, fontWeight: 800 }} title={`Read as ${b[k - 1]}`}>{ch}</u> : <span key={i}>{ch}</span>;
+      })}
+    </span>
+  );
+}
+
 function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm, onNone, onManual }) {
   if (phase === "barcode" || phase === "ocr" || phase === "checking") {
     const title = phase === "checking" ? "Checking the guest list" : phase === "barcode" ? "Reading code" : "Barcode unreadable";
@@ -840,7 +942,7 @@ function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm
         <div className="state">{camera ? <ScanLine size={24} color="var(--gold)" /> : <AlertTriangle size={24} color="var(--warn)" />} {camera ? "Ready for the next attendee" : "Scanning paused"}</div>
         <p className="muted text-lg">{camera
           ? (live
-            ? "Camera is live. Ask the attendee to show their QR ticket, or the barcode on their student ID, inside the frame. It checks in as soon as the code is read. The OCR fallback is still simulated, so use the demo scenarios for that path."
+            ? "Camera is live. Ask the attendee to show their QR ticket, or the barcode on their student ID, inside the frame. It checks in as soon as the code is read. If the barcode won't scan, press Read printed number."
             : "Ask the attendee to show their QR ticket or student ID inside the frame. If the code can't be read, SELAE reads the printed student number.")
           : "The camera is off. Use manual entry to keep checking attendees in."}</p>
       </div>
@@ -864,11 +966,12 @@ function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm
           <p className="font-bold">
             {result.method === "qr" && "Identified by QR ticket"}
             {result.method === "barcode" && "Identified by ID barcode"}
-            {result.method === "ocr" && `Identified by OCR, ${pct(result.confidence)} match`}
-            {result.method === "confirmed" && `Confirmed by operator, ${pct(result.confidence)} match`}
+            {result.method === "ocr" && `Identified by OCR, ${sure(result.confidence)} sure`}
+            {result.method === "confirmed" && `Confirmed by operator (SELAE gave ${pct(result.confidence)})`}
             {result.method === "manual" && "Entered manually"}
             {` at ${fmtTime(result.time)}`}
           </p>
+          {result.learned && <p className="text-sm flex items-center gap-2"><Brain size={15} /> SELAE learned from this correction.</p>}
           <div className="countdown" aria-hidden="true"><div style={{ animationDuration: "3.5s" }} /></div>
         </div>
       );
@@ -927,19 +1030,36 @@ function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm
       return (
         <div className="result warn">
           <div className="state"><AlertTriangle size={28} /> Confirm this attendee</div>
-          <p className="text-lg">The student number was hard to read. SELAE read <strong>{result.read}</strong>. Check the ID and choose the matching student.</p>
+          <p className="text-lg">SELAE read <strong>{result.read}</strong> but isn't sure enough to decide alone. Check the ID and choose the matching student.</p>
           <div className="flex flex-col gap-2">
-            {result.candidates.map((c, i) => (
+            {result.candidates.filter((c) => c.p >= 0.01).map((c, i) => (
               <button key={c.student.id} className="cand" onClick={() => onConfirm(c)} autoFocus={i === 0}>
                 <span>
                   <span className="font-bold text-lg block">{formatName(c.student)}</span>
-                  <span>{c.student.id}, {c.student.section}</span>
+                  <span><DigitDiff id={c.student.id} read={result.read} />{c.student.section ? `, ${c.student.section}` : ""}</span>
+                  {c.status !== "going" && <span className="block text-sm font-bold">{STATUS_NOTE[c.status]}</span>}
                 </span>
-                <span className="font-bold">{pct(c.confidence)}</span>
+                <span className="font-bold">{pct(c.p)}</span>
               </button>
             ))}
           </div>
+          {result.pUnknown >= 0.01 && <p className="text-sm">{pct(result.pUnknown)} chance it's someone not on file. Underlined digits differ from what was read.</p>}
           <button className="btn btn-on mt-auto" onClick={onNone}>None of these, type it instead</button>
+        </div>
+      );
+    case "lowmatch":
+      return (
+        <div className="result warn">
+          <div className="state"><HelpCircle size={28} /> No confident match</div>
+          <p className="text-lg">
+            SELAE read <strong>{result.read}</strong> but couldn't match it to anyone with confidence
+            {result.best ? <> (closest: {formatName(result.best.student)}, {pct(result.best.p)})</> : null}.
+            Check the ID and type the student number or name. Your answer teaches SELAE how this camera misreads digits.
+          </p>
+          <div className="flex flex-col gap-2 mt-auto">
+            <button className="btn btn-on" onClick={onManual} autoFocus><Keyboard size={16} /> Go to manual entry</button>
+            <button className="btn btn-on" onClick={onReset}>Next attendee</button>
+          </div>
         </div>
       );
     case "unknown":
@@ -965,7 +1085,9 @@ function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm
       return (
         <div className="result warn">
           <div className="state"><HelpCircle size={28} /> Couldn't read this ID</div>
-          <p className="text-lg">Neither the barcode nor the student number could be read. Type the student number or name in manual entry.</p>
+          <p className="text-lg">{result.noDigits
+            ? "OCR couldn't find a student number in the frame. Hold the ID flat inside the frame, tilt it away from the light, and try again, or use manual entry."
+            : "Neither the barcode nor the student number could be read. Type the student number or name in manual entry."}</p>
           <button className="btn btn-on mt-auto" onClick={onManual}><Keyboard size={16} /> Go to manual entry</button>
         </div>
       );
@@ -975,7 +1097,7 @@ function ResultPanel({ phase, result, camera, live, capacity, onReset, onConfirm
 /* ---------------- analytics ---------------- */
 const METHOD_COLOR = { qr: "#7FA2FF", barcode: "#B9CBFF", ocr: "#E4B23E", confirmed: "#F39A3D", manual: "#7384AB" };
 
-function Analytics({ data, now, onToast }) {
+function Analytics({ data, now, onToast, refresh }) {
   const { students, registered, checkins, log, opens, ends, event } = data;
   const attended = checkins.size;
   const reg = registered.size;
@@ -1106,6 +1228,8 @@ function Analytics({ data, now, onToast }) {
           </div>
         </section>
 
+        {data.matcher && <MatcherPanel m={data.matcher} onToast={onToast} refresh={refresh} />}
+
         <section className="panel p-4 md:p-5 min-w-0 lg:col-span-2">
           <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
             <h3 className="font-bold text-lg">Attendance by section</h3>
@@ -1132,6 +1256,79 @@ function Analytics({ data, now, onToast }) {
         </section>
       </div>
     </div>
+  );
+}
+
+/* ---------------- intelligent matcher ---------------- */
+/* How the OCR matcher (server/matcher.js) is doing at this event, and
+   what it has learned from operator corrections so far. */
+const DECISION_LABEL = { auto: "Identified automatically", confirm: "Asked the operator", reject: "No confident match" };
+const RESOLUTION_LABEL = { auto: "auto", confirmed: "operator picked", manual: "typed by operator", none: "none of these" };
+
+function MatcherPanel({ m, onToast, refresh }) {
+  const { scans } = m;
+  const resetModel = async () => {
+    if (!window.confirm("Forget everything SELAE has learned about how this camera misreads digits?")) return;
+    try { await api.resetMatcher(); onToast("Matcher reset to its starting beliefs"); refresh(); }
+    catch (e) { onToast(e.message); }
+  };
+  const digitLabel = (d) => (d == null ? "nothing" : String(d));
+  return (
+    <section className="panel p-4 md:p-5 min-w-0 lg:col-span-2">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div style={{ maxWidth: 760 }}>
+          <h3 className="font-bold text-lg flex items-center gap-2"><Brain size={19} /> OCR matcher</h3>
+          <p className="muted mt-1">
+            When a code won't scan, SELAE reads the printed student number and works out who it most likely belongs to, using how
+            OCR tends to misread digits and who is expected at this event. It decides alone above {pct(m.thresholds.autoAt)} certainty,
+            asks the operator from {pct(m.thresholds.confirmAt)}, and learns from every correction.
+          </p>
+        </div>
+        <button className="btn btn-sm btn-ghost" onClick={resetModel}>Reset learning</button>
+      </div>
+
+      <dl className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-5">
+        <div><dt className="text-sm muted">OCR reads</dt><dd className="text-2xl font-bold">{scans.total}</dd>
+          <dd className="text-sm faint">{scans.auto} automatic, {scans.confirm} asked, {scans.reject} no match{scans.demo ? `; ${scans.demo} from demos` : ""}</dd></div>
+        <div><dt className="text-sm muted">Right student ranked first</dt>
+          <dd className="text-2xl font-bold">{scans.labelled ? pct(scans.top1 / scans.labelled) : "No data"}</dd>
+          <dd className="text-sm faint">{scans.labelled ? `${scans.top1} of ${scans.labelled} reads an operator resolved; top 3: ${scans.top3}` : "Appears once an operator resolves a read"}</dd></div>
+        <div><dt className="text-sm muted">Corrections learned</dt><dd className="text-2xl font-bold">{m.corrections}</dd>
+          <dd className="text-sm faint">{m.updatedAt ? `Last at ${fmtTime(new Date(m.updatedAt))}` : "None yet, across all events"}</dd></div>
+        <div><dt className="text-sm muted">Chance a digit reads correctly</dt>
+          <dd className="text-2xl font-bold">{pct(m.digitAccuracy.now)}</dd>
+          <dd className="text-sm faint">Started at {pct(m.digitAccuracy.prior)}; changes as corrections come in</dd></div>
+      </dl>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+        <div>
+          <div className="font-bold mb-2">Misreads learned at this venue</div>
+          {m.topConfusions.length ? (
+            <ul className="flex flex-col gap-1">
+              {m.topConfusions.map((c) => (
+                <li key={`${c.true}-${c.read}`} className="flex justify-between gap-3">
+                  <span><strong>{c.true}</strong> read as <strong>{digitLabel(c.read)}</strong></span>
+                  <span className="muted">{c.count} {c.count === 1 ? "time" : "times"}</span>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="muted text-sm">Nothing yet. When an operator picks or types the right student after an unsure read, the digits that were misread show up here.</p>}
+        </div>
+        <div>
+          <div className="font-bold mb-2">Recent reads</div>
+          {m.recent.length ? (
+            <ul className="flex flex-col gap-1 text-sm">
+              {m.recent.map((r, i) => (
+                <li key={i} className="flex flex-wrap justify-between gap-x-3">
+                  <span><span className="font-bold">{r.read}</span> <span className="muted">{DECISION_LABEL[r.decision]}{r.top ? `, ${sure(r.top.p)}` : ""}</span></span>
+                  <span className="faint">{r.resolution ? RESOLUTION_LABEL[r.resolution] : "open"}{r.learned && r.learned.length ? `, learned ${r.learned.join(", ")}` : ""}</span>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="muted text-sm">No OCR reads at this event yet.</p>}
+        </div>
+      </div>
+    </section>
   );
 }
 

@@ -66,6 +66,8 @@ export const api = {
   cancel: (code) => request("POST", `/api/tickets/${code}/cancel`),
   manage: (id, rev) => request("GET", `/api/events/${id}/manage${rev ? `?rev=${rev}` : ""}`),
   checkin: (id, body) => request("POST", `/api/events/${id}/checkin`, body),
-  logUnresolved: (id, method) => request("POST", `/api/events/${id}/log`, { outcome: "unresolved", method }),
+  logUnresolved: (id, method, scanId) => request("POST", `/api/events/${id}/log`, { outcome: "unresolved", method, scanId }),
+  match: (id, body) => request("POST", `/api/events/${id}/match`, body),
+  resetMatcher: () => request("POST", "/api/matcher/reset"),
   promote: (id, regId) => request("POST", `/api/events/${id}/registrations/${regId}/promote`),
 };

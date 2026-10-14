@@ -1,5 +1,6 @@
 import os from "node:os";
 import { newCode, newId, hashKey } from "./seed.js";
+import { ensureModel, rank, priorWeight, learn, pretty, digitsOf, topConfusions, digitAccuracy, emptyModel } from "./matcher.js";
 
 /* ------------------------------------------------------------------
    Logical layer: every rule about events, registration and check-in.
@@ -135,6 +136,8 @@ function checkIn(data, event, body) {
     reg = data.registrations.find((r) => r.eventId === event.id && r.studentId === studentId && r.status !== "cancelled") || null;
   }
 
+  resolveScan(data, event, body, method, studentId);
+
   const student = data.directory[studentId] || { id: studentId, last: "", first: "", middle: "", suffix: "", section: "" };
   if (!reg || reg.status === "cancelled") { log("notreg", studentId); return { outcome: "notreg", time: now, student }; }
   if (reg.status === "waitlist") { log("waitlist", studentId); return { outcome: "waitlist", time: now, student }; }
@@ -143,6 +146,83 @@ function checkIn(data, event, body) {
   reg.checkin = { time: now, method, confidence };
   log("approved", studentId, { confidence });
   return { outcome: "approved", time: now, student, checkin: reg.checkin };
+}
+
+/* ---------- OCR matching (see matcher.js) ---------- */
+const MAX_SCANS = 3000;
+
+/** Everyone the OCR read could belong to, each with a prior weight from this event. */
+function peopleFor(data, event) {
+  const regs = new Map();
+  for (const r of data.registrations) if (r.eventId === event.id && r.status !== "cancelled") regs.set(r.studentId, r);
+  return Object.values(data.directory).map((s) => ({ id: s.id, weight: priorWeight(regs.get(s.id)), reg: regs.get(s.id) || null }));
+}
+
+function statusOf(reg) {
+  if (!reg) return "notreg";
+  if (reg.status === "waitlist") return "waitlist";
+  return reg.checkin ? "inside" : "going";
+}
+
+function matchRead(data, event, body) {
+  const read = digitsOf(body.read);
+  if (!read.length || read.length > 20) fail(400, "Send the digits OCR read.");
+  const conf = Array.isArray(body.conf) && body.conf.length === read.length && body.conf.every((c) => typeof c === "number")
+    ? body.conf.map((c) => Math.max(0, Math.min(1, c))) : null;
+  const model = ensureModel(data);
+  const out = rank(peopleFor(data, event), read, conf, model);
+  const scan = {
+    id: newId(), eventId: event.id, time: new Date().toISOString(), read, conf, source: body.source === "demo" ? "demo" : "camera",
+    decision: out.decision, pUnknown: out.pUnknown,
+    candidates: out.candidates.map((c) => ({ id: c.id, p: c.p })),
+    resolution: null, truth: null, rank: null, learned: null,
+  };
+  data.ocrScans.push(scan);
+  if (data.ocrScans.length > MAX_SCANS) data.ocrScans.splice(0, data.ocrScans.length - MAX_SCANS);
+  return {
+    scanId: scan.id, read: pretty(read), decision: out.decision, pUnknown: out.pUnknown, thresholds: out.thresholds,
+    candidates: out.candidates.map((c) => ({ p: c.p, status: statusOf(c.reg),
+      student: data.directory[c.id] || { id: c.id, last: "", first: "", middle: "", suffix: "", section: "" } })),
+  };
+}
+
+/** A check-in that came from an OCR scan: record who it turned out to be, and learn when a person said so. */
+function resolveScan(data, event, body, method, studentId) {
+  if (!body.scanId) return;
+  const scan = (data.ocrScans || []).find((s) => s.id === body.scanId && s.eventId === event.id);
+  // "none" means the operator rejected every candidate; typing the right student afterwards still labels it
+  if (!scan || (scan.resolution && scan.resolution !== "none")) return;
+  scan.resolution = method === "ocr" ? "auto" : method === "confirmed" ? "confirmed" : "manual";
+  scan.truth = studentId;
+  scan.rank = scan.candidates.findIndex((c) => c.id === studentId);
+  // Only a human's answer is a label worth learning from; the matcher's own guesses are not
+  if (method === "confirmed" || method === "manual") scan.learned = learn(ensureModel(data), scan.read, studentId);
+}
+
+function matcherSummary(data, eventId) {
+  const model = ensureModel(data);
+  const scans = data.ocrScans.filter((s) => s.eventId === eventId);
+  const by = (k, v) => scans.filter((s) => s[k] === v).length;
+  const labelled = scans.filter((s) => s.resolution === "confirmed" || s.resolution === "manual");
+  return {
+    corrections: model.corrections,
+    updatedAt: model.updatedAt,
+    thresholds: model.thresholds,
+    digitAccuracy: { prior: digitAccuracy(null), now: digitAccuracy(model) },
+    topConfusions: topConfusions(model),
+    scans: {
+      total: scans.length,
+      auto: by("decision", "auto"), confirm: by("decision", "confirm"), reject: by("decision", "reject"),
+      // Of the reads a person resolved, where was the right student in SELAE's ranking?
+      labelled: labelled.length,
+      top1: labelled.filter((s) => s.rank === 0).length,
+      top3: labelled.filter((s) => s.rank >= 0).length,
+      none: by("resolution", "none"),
+      demo: by("source", "demo"),
+    },
+    recent: scans.slice(-8).reverse().map((s) => ({ time: s.time, read: pretty(s.read), decision: s.decision, top: s.candidates[0] || null,
+      resolution: s.resolution, truth: s.truth, learned: s.learned })),
+  };
 }
 
 /* ---------- routing ---------- */
@@ -269,6 +349,7 @@ export function createApi(store) {
         registrations: regs,
         logs: d.logs.filter((l) => l.eventId === id).sort((a, b) => b.time.localeCompare(a.time)),
         directory: Object.values(d.directory),
+        matcher: matcherSummary(d, id),
       };
     }],
 
@@ -284,8 +365,27 @@ export function createApi(store) {
       requireManage(req, event);
       const b = await readBody(req);
       if (b.outcome !== "unresolved") fail(400, "Only unreadable scans can be logged directly.");
-      store.mutate((d) => d.logs.push({ uid: newId(), eventId: id, time: new Date().toISOString(), studentId: null, outcome: "unresolved",
-        method: ["qr", "barcode", "ocr"].includes(b.method) ? b.method : "ocr" }));
+      store.mutate((d) => {
+        d.logs.push({ uid: newId(), eventId: id, time: new Date().toISOString(), studentId: null, outcome: "unresolved",
+          method: ["qr", "barcode", "ocr"].includes(b.method) ? b.method : "ocr" });
+        const scan = b.scanId && (d.ocrScans || []).find((s) => s.id === b.scanId && s.eventId === id);
+        if (scan && !scan.resolution) scan.resolution = "none";
+      });
+      return { ok: true };
+    }],
+
+    // OCR read in, ranked candidates and a decision out
+    ["POST", /^\/api\/events\/([\w-]+)\/match$/, async (req, [id]) => {
+      const event = findEvent(id);
+      requireManage(req, event);
+      const body = await readBody(req);
+      return store.mutate((d) => matchRead(d, event, body));
+    }],
+
+    // Forget what the matcher learned (the laptop running the server only)
+    ["POST", /^\/api\/matcher\/reset$/, (req) => {
+      if (!isLocal(req)) fail(403, "Only the laptop running SELAE can reset the matcher.");
+      store.mutate((d) => { const t = d.matcher ? d.matcher.thresholds : undefined; d.matcher = emptyModel(); if (t) d.matcher.thresholds = t; });
       return { ok: true };
     }],
 
