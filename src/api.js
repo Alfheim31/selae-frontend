@@ -70,4 +70,5 @@ export const api = {
   match: (id, body) => request("POST", `/api/events/${id}/match`, body),
   resetMatcher: () => request("POST", "/api/matcher/reset"),
   promote: (id, regId) => request("POST", `/api/events/${id}/registrations/${regId}/promote`),
+  release: (id, risk) => request("POST", `/api/events/${id}/release`, { risk }),
 };

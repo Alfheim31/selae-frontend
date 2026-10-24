@@ -26,12 +26,16 @@ internet connection is needed.
   unlisted. Anyone can create one.
 - **Live dashboard** — headcount against capacity, arrivals over time, guest list
   with waitlist (move people to going), feed of recent scans including failures.
+  A **turnout forecast** predicts the final headcount, shows each guest's chance
+  of coming, and recommends how many people to **release off the waitlist**
+  (see below).
 - **Gate scanner** — live webcam that reads **QR tickets** and **student ID
   barcodes**. When a code won't scan, **Read printed number** reads the student
   number off the ID with OCR, and a Bayesian matcher works out who it is (see
   below). Manual entry, and a locked gate mode for volunteers.
 - **Analytics** — show-up rate, check-ins over time, attendance by section, how
-  each attendee was identified, CSV export.
+  each attendee was identified, how the OCR matcher and the turnout model are
+  doing, CSV export.
 - **Test tickets** — live QR codes for guests, to test or demo the scanner.
 - **Invite & settings** — a QR code and link to the registration page, a co-host
   link, and the event details (including closing registration).
@@ -81,11 +85,19 @@ real authentication: there are no accounts or passwords.
 ## Data
 
 Events, registrations and scans are saved to `data/selae.json` on the laptop
-(ignored by git). The first run creates it with a demo event, the CS Department
-General Assembly, already 42 minutes into check-in. To start over, stop the server
-and delete the file. To keep a different file, set `SELAE_DATA=path/to/file.json`.
+(ignored by git). The first run creates it with:
 
-## The intelligent component: OCR matching that learns
+- a semester of **simulated past events** (14 of them, marked as simulated), so
+  the turnout forecast has history to learn from;
+- the CS Department General Assembly, already 42 minutes into check-in;
+- the Intro to Machine Learning Workshop, two days out, with 60 seats and a
+  52-person waitlist.
+
+To start over, stop the server and delete the file. A data file from before the
+turnout forecast has no past events, so the forecast falls back to an average
+show-up rate until you delete it or run real events. To keep a different file, set `SELAE_DATA=path/to/file.json`.
+
+## Intelligent component 1: OCR matching that learns
 
 When a QR ticket or ID barcode can't be read, SELAE reads the printed student
 number and decides who the attendee is. OCR under glare makes mistakes, so this
@@ -155,6 +167,89 @@ npm run eval -- --csv reads.csv --roster roster.txt
 separated by spaces); `roster.txt` lists the registered student numbers. The
 first half of the reads is learned from, the second half is tested.
 
+## Intelligent component 2: turnout forecast and waitlist release
+
+The matcher answers "who is this at the gate?". The forecast answers the
+logistics questions: how many of the people registered will actually come, and
+how many people can come in off the waitlist without anyone being turned away
+at the door. Free student events lose a lot of registrants (about 4 in 10 in the
+simulated history), so a "full" event usually has empty seats while its
+waitlist waits. The code is `server/forecast.js`.
+
+1. **Learns from past events.** Every registration at a finished event is a
+   labelled example: they checked in or they didn't. A logistic regression,
+   fitted by Newton's method with a small L2 penalty, learns P(show up) from
+   what SELAE can see: how far ahead they registered (and whether it was the
+   same day), their own record at earlier events (smoothed show-up rate, first
+   event or not, missed their last one), year level, the time and day of the
+   event, and whether they got in off the waitlist. Each example's features
+   come only from events *before* it, so the model never sees the future.
+2. **Explains itself.** Each feature's contribution (weight × standardized
+   value) names what drove a prediction: "came to 1 of 6 past events",
+   "registered 9 days ahead". Hover a percentage on the guest list to see it.
+3. **Updates during check-in.** Not having arrived yet is evidence. From past
+   events SELAE knows F(t), the share of attendees who have arrived t minutes in,
+   and by Bayes' rule P(comes | not here at t) = p(1 − F(t)) / (p(1 − F(t)) + 1 − p).
+4. **Accounts for whole events swinging.** People don't decide independently:
+   rain or an exam the next day moves everyone. SELAE measures how far past
+   events landed from its forecast (refitting on the events before each one),
+   models that as a shift on everyone's log-odds, and averages over it with
+   Gauss–Hermite quadrature. During check-in, who has and hasn't arrived
+   updates its belief about this event's shift.
+5. **Decides how many to release.** Given the shift, arrivals follow a
+   Poisson-binomial distribution, computed exactly. Releasing k more people (in
+   waitlist order, to stay fair) raises the expected headcount and the chance
+   that more come than the venue holds. SELAE recommends the largest k whose
+   chance of overflow stays under the organizer's limit (1%, 5% or 10%), and
+   shows the trade-off as a chart. The organizer presses the button; nothing
+   is released on its own, and the gate still refuses anyone past capacity.
+
+**Analytics → Turnout model** shows the model's scores on the most recent past
+events held out, its calibration, and the weight it learned for each fact.
+
+### Evaluating it
+
+```bash
+npm run eval:turnout
+```
+
+This simulates 5 separate worlds, each with 400 students and 40 oversubscribed
+events. Every student has a hidden reliability the model never sees. The script
+then walks forward through the last 12 events of each world (60 events), training
+only on what had finished before each one. Results with seed 11:
+
+| Predicting who comes | AUC | Brier | Log loss |
+|---|---|---|---|
+| Average past show-up rate | 0.500 | 0.249 | 0.691 |
+| Each person's own past rate | 0.736 | 0.208 | 0.603 |
+| Logistic regression (SELAE) | 0.744 | 0.205 | 0.596 |
+
+| Waitlist release | Released | Empty seats | Seats filled | Chance of overflow | Turned away |
+|---|---|---|---|---|---|
+| No release (SELAE before this) | 0.0 | 36.6 | 53.2% | 0.0% | 0.00 |
+| Fixed 15% overbook | 11.8 | 31.1 | 60.3% | 0.0% | 0.00 |
+| Capacity ÷ average rate | 60.6 | 8.5 | 89.1% | 37.0% | 3.87 |
+| Forecast, attendees assumed independent, 5% | 55.7 | 9.5 | 87.8% | 20.2% | 1.29 |
+| **Forecast, 1% risk** | 34.4 | 20.2 | 74.2% | 1.9% | 0.06 |
+| **Forecast, 5% risk** | 43.6 | 15.4 | 80.3% | 7.0% | 0.31 |
+| **Forecast, 10% risk** | 48.2 | 13.2 | 83.1% | 11.4% | 0.60 |
+
+What this shows, honestly:
+
+- Most of the ranking power comes from a person's own record. The other
+  features add a little on top. With real data that balance may differ.
+- The release decision is where the forecast pays off. It fills 74–83% of seats
+  instead of 53%, and its overflow rate lands close to the risk you pick. The
+  naive "capacity ÷ average rate" rule fills slightly more seats but overflows
+  over a third of events.
+- Treating attendees as independent made a 5% setting overflow 20% of the time.
+  Modelling event-level swings is what brought it back to 7%. It still runs a
+  little over target, so 5% is better read as "about 5–7%".
+
+These numbers come from simulated events. Once SELAE has run a few real events,
+the forecast trains on those instead (Analytics shows how many past events are
+real), and the held-out scores there become the ones to report.
+
 ## Testing the scanner
 
 1. On your phone (same Wi-Fi), scan the QR code in **Invite & settings** and
@@ -186,8 +281,11 @@ server/
   api.js               logical layer: registration, waitlist, check-in rules
   matcher.js           intelligent component: Bayesian OCR matching and learning
   matcher.test.js      unit tests for the matcher (npm test)
+  forecast.js          intelligent component: turnout forecast and waitlist release
+  forecast.test.js     unit tests for the forecast (npm test)
+  simulate.js          simulated event history, for the demo data and the evaluation
   store.js             physical layer: the JSON data file, atomic writes
-  seed.js              demo event and student directory for the first run
+  seed.js              demo events, past history and student directory for the first run
 src/
   SELAE_Frontend.jsx   routing and the organizer console
   public.jsx           events, event page, registration, ticket, create event
@@ -195,10 +293,12 @@ src/
   camera.jsx           webcam access, beeps, hold-to-exit
   barcode.js           live QR / barcode decoding from the camera (zxing-cpp)
   ocr.js               OCR of the printed student number (Tesseract), with glare correction
+  forecast.jsx         turnout forecast panel, waitlist release, turnout model panel
   api.js               client for the server API; host keys and tickets per device
   main.jsx             entry point
 scripts/
   eval-matcher.js      evaluation: matcher vs. edit distance, threshold sweep (npm run eval)
+  eval-turnout.js      evaluation: forecast vs. simpler predictors and release rules (npm run eval:turnout)
 ```
 
 ## Stack
@@ -223,5 +323,5 @@ scripts/
 This prototype exists to settle the interface and the rules before the Java
 version is written. JavaFX is the closest match for the organizer console, and
 the original ZXing library (`com.google.zxing`) covers QR and barcode decoding.
-Tess4J does the OCR there, and `server/matcher.js` has no dependencies, so it
-ports to Java line for line.
+Tess4J does the OCR there, and `server/matcher.js` and `server/forecast.js` have
+no dependencies, so they port to Java line for line.

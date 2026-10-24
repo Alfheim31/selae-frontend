@@ -8,8 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "vite build && node server/index.js",
-    "test": "node --test server/matcher.test.js",
-    "eval": "node scripts/eval-matcher.js"
+    "test": "node --test server/matcher.test.js server/forecast.test.js",
+    "eval": "node scripts/eval-matcher.js",
+    "eval:turnout": "node scripts/eval-turnout.js"
   },
   "dependencies": {
     "@tesseract.js-data/eng": "^1.0.0",
