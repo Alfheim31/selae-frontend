@@ -1,6 +1,7 @@
 import os from "node:os";
 import { newCode, newId, hashKey } from "./seed.js";
 import { ensureModel, rank, priorWeight, learn, pretty, digitsOf, topConfusions, digitAccuracy, emptyModel } from "./matcher.js";
+import { trainTurnout, predictEvent, forecastNow, DEFAULT_RISK } from "./forecast.js";
 
 /* ------------------------------------------------------------------
    Logical layer: every rule about events, registration and check-in.
@@ -247,7 +248,40 @@ function lanUrls(req) {
   return urls;
 }
 
+/* ---------- turnout forecast (see forecast.js) ---------- */
+// Retrained only when the set of finished events or their outcomes change, not on every check-in
+function historyKey(data, now) {
+  const past = new Set(data.events.filter((e) => new Date(e.endsAt) < now).map((e) => e.id));
+  let regs = 0, came = 0;
+  for (const r of data.registrations) if (past.has(r.eventId)) { regs += r.status === "going"; came += Boolean(r.checkin); }
+  return `${[...past].sort().join(",")}|${regs}|${came}`;
+}
+
 export function createApi(store) {
+  let turnout = null, turnoutKey = "";
+  const turnoutModel = () => {
+    const now = new Date();
+    const key = historyKey(store.data, now);
+    if (!turnout || key !== turnoutKey) { turnout = trainTurnout(store.data, now); turnoutKey = key; }
+    return turnout;
+  };
+  const forecastFor = (event, risk = DEFAULT_RISK) => {
+    const model = turnoutModel();
+    const regs = store.data.registrations.filter((r) => r.eventId === event.id);
+    return forecastNow({ capacity: event.capacity, startsAt: event.startsAt, endsAt: event.endsAt, regs,
+      preds: predictEvent(model, store.data, event), arrival: model.arrival, spread: model.spread, now: new Date(), risk });
+  };
+  const forecastSummary = (event) => {
+    const m = turnoutModel();
+    return {
+      model: { ready: m.ready, trainedAt: m.trainedAt, events: m.events, examples: m.examples, simulated: m.simulated,
+        baseRate: m.baseRate, holdout: m.holdout, weights: m.weights, spread: m.spread },
+      arrival: m.arrival,
+      spread: m.spread,
+      preds: predictEvent(m, store.data, event),
+      defaultRisk: DEFAULT_RISK,
+    };
+  };
   const findEvent = (id) => store.data.events.find((e) => e.id === id) || fail(404, "Event not found.");
   const requireManage = (req, event) => { if (!canManage(req, event)) fail(403, "Only this event's hosts can do that."); };
 
@@ -325,12 +359,14 @@ export function createApi(store) {
       return store.mutate((d) => {
         const wasGoing = reg.status === "going";
         reg.status = "cancelled";
-        if (wasGoing) {
-          // A spot opened up: the longest-waiting person on the waitlist gets it
+        const event = d.events.find((e) => e.id === reg.eventId);
+        // A spot opened up: the longest-waiting person on the waitlist gets it. If seats were
+        // released off the forecast and the event is still over capacity, nobody moves up.
+        if (wasGoing && event && counts(d, reg.eventId).going < event.capacity) {
           const next = d.registrations
             .filter((r) => r.eventId === reg.eventId && r.status === "waitlist")
             .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
-          if (next) next.status = "going";
+          if (next) { next.status = "going"; next.promotedAt = new Date().toISOString(); next.promotedBy = "cancellation"; }
         }
         return ticketView(d, req, reg);
       });
@@ -350,6 +386,7 @@ export function createApi(store) {
         logs: d.logs.filter((l) => l.eventId === id).sort((a, b) => b.time.localeCompare(a.time)),
         directory: Object.values(d.directory),
         matcher: matcherSummary(d, id),
+        forecast: forecastSummary(event),
       };
     }],
 
@@ -394,8 +431,27 @@ export function createApi(store) {
       requireManage(req, event);
       const reg = store.data.registrations.find((r) => r.id === regId && r.eventId === id) || fail(404, "Registration not found.");
       if (reg.status !== "waitlist") fail(409, "Only waitlisted guests can be moved to going.");
-      store.mutate(() => { reg.status = "going"; });
+      store.mutate(() => { reg.status = "going"; reg.promotedAt = new Date().toISOString(); reg.promotedBy = "organizer"; });
       return { ok: true };
+    }],
+
+    // Let people in off the waitlist, as many as the turnout forecast says is safe (see forecast.js)
+    ["POST", /^\/api\/events\/([\w-]+)\/release$/, async (req, [id]) => {
+      const event = findEvent(id);
+      requireManage(req, event);
+      const b = await readBody(req);
+      const risk = typeof b.risk === "number" && b.risk > 0 && b.risk < 0.5 ? b.risk : DEFAULT_RISK;
+      const f = forecastFor(event, risk);
+      const k = Number.isInteger(b.count) ? Math.min(b.count, f.release) : f.release;
+      if (k < 1) fail(409, f.ended ? "This event has already ended." : "The forecast doesn't leave room for anyone else at that risk.");
+      const ids = new Set(f.waitlistOrder.slice(0, k));
+      const now = new Date().toISOString();
+      store.mutate((d) => {
+        for (const r of d.registrations) if (ids.has(r.id) && r.status === "waitlist") {
+          r.status = "going"; r.promotedAt = now; r.promotedBy = "forecast";
+        }
+      });
+      return { released: ids.size, overflow: f.steps[k].overflow, empty: f.steps[k].empty };
     }],
   ];
 

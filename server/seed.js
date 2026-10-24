@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
+import { rng as simRng, makeWorld, simulateHistory } from "./simulate.js";
 
 /* ------------------------------------------------------------------
-   First-run data: a student directory and one demo event that is
-   already 42 minutes into check-in, so the dashboard and analytics
-   have something to show. Same seeded generator as the original
+   First-run data: a student directory, a semester of simulated past
+   events (so the turnout forecast has history to learn from), one demo
+   event that is already 42 minutes into check-in, and an upcoming
+   workshop that is oversubscribed, with a waitlist. Same seeded generator as the original
    prototype, so the names and student numbers are stable.
 ------------------------------------------------------------------- */
 
@@ -106,11 +108,46 @@ export function buildSeed(now) {
   });
   logs.push({ uid: newId(), eventId: event.id, time: at(31), studentId: null, outcome: "unresolved", method: "ocr" });
 
+  // A semester of past events. Separate random stream, so the names and numbers above don't change.
+  const hr = simRng(2026);
+  const world = makeWorld(students, hr);
+  const history = simulateHistory({ students, now, r: hr, world, count: 14, spacingDays: 6, endDaysAgo: 3, newId, newCode });
+  const hidden = ({ _p, _effect, ...rest }) => rest; // the simulator's ground truth stays out of the data file
+  history.events.forEach((e) => { e.hostKeyHash = hashKey(crypto.randomBytes(16).toString("hex")); });
+
+  // An upcoming workshop with more sign-ups than seats: the case the waitlist release is for
+  const wsStart = new Date(now.getTime() + 2 * 86400000);
+  if (wsStart.getDay() === 0) wsStart.setDate(wsStart.getDate() + 1);
+  if (wsStart.getDay() === 6) wsStart.setDate(wsStart.getDate() + 2);
+  wsStart.setHours(13, 0, 0, 0);
+  const workshop = {
+    id: "ml-workshop",
+    title: "Intro to Machine Learning Workshop",
+    description: "A hands-on afternoon building your first classifier in Python. Laptops provided; seats are limited to the lab's 60 workstations.",
+    startsAt: wsStart.toISOString(),
+    endsAt: new Date(wsStart.getTime() + 3 * 3600000).toISOString(),
+    venue: "CISTM Computer Lab 1",
+    capacity: 60,
+    color: "violet",
+    visibility: "public",
+    registrationOpen: true,
+    hostName: "GDG on Campus PLM",
+    hostKeyHash: hashKey(crypto.randomBytes(16).toString("hex")),
+    createdAt: new Date(now.getTime() - 10 * 86400000).toISOString(),
+  };
+  const wsPool = students.slice().sort(() => hr() - 0.5).slice(0, 112);
+  const wsRegs = wsPool.map((s) => ({
+    id: newId(), eventId: workshop.id, code: newCode(), studentId: s.id, email: "", status: "going",
+    createdAt: new Date(Math.min(now.getTime() - 3600000, wsStart.getTime() - (0.3 + -Math.log(1 - hr()) * 3) * 86400000)).toISOString(),
+    checkin: null,
+  })).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  wsRegs.forEach((reg, k) => { if (k >= workshop.capacity) reg.status = "waitlist"; });
+
   return {
     rev: 1,
     directory: Object.fromEntries(students.map((s) => [s.id, s])),
-    events: [event],
-    registrations,
-    logs,
+    events: [...history.events.map(hidden), event, workshop],
+    registrations: [...history.registrations.map(hidden), ...registrations, ...wsRegs],
+    logs: [...history.logs, ...logs],
   };
 }

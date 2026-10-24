@@ -13,6 +13,7 @@ import {
   CSS, Mark, QrCode, go, useHashRoute, useToast, fmtTime, fmtDate, fmtDateShort, formatName, norm, pct, lev, simulateRead,
   METHOD_LABEL, METHOD_SHORT, OUTCOME_LABEL,
 } from "./shared.jsx";
+import { useForecast, Likely, TurnoutPanel, TurnoutModelPanel } from "./forecast.jsx";
 import { TopBar, Discover, EventPage, TicketPage, MyTickets, CreateEvent, EventForm } from "./public.jsx";
 
 /* ------------------------------------------------------------------
@@ -75,6 +76,7 @@ function toData(s) {
   return {
     event: s.event,
     matcher: s.matcher || null,
+    forecast: s.forecast || null,
     capacity: s.event.capacity,
     opens: new Date(s.event.startsAt),
     ends: new Date(s.event.endsAt),
@@ -340,6 +342,10 @@ function Dashboard({ data, now, refresh, onToast, onOpen }) {
   const attention = log.filter((l) => l.outcome !== "approved");
   const { size, buckets } = useMemo(() => arrivalBuckets(checkins, now, opens, ends), [checkins, now, opens, ends]);
   const notYet = Math.max(0, registered.size - [...registered].filter((sid) => checkins.has(sid)).length);
+  const [risk, setRisk] = useState(data.forecast ? data.forecast.defaultRisk : 0.05);
+  const f = useForecast(data, now, risk);
+  const likely = (reg) => (f && reg && f.live[reg.id] != null
+    ? <Likely compact p={f.live[reg.id]} why={data.forecast.preds[reg.id] && data.forecast.preds[reg.id].why} /> : null);
 
   const rows = useMemo(() => {
     const n = norm(q);
@@ -391,6 +397,8 @@ function Dashboard({ data, now, refresh, onToast, onOpen }) {
 
       {registered.size === 0 && waitlist.length === 0 && <ShareCard eventId={event.id} />}
 
+      {(registered.size > 0 || waitlist.length > 0) && <TurnoutPanel data={data} f={f} risk={risk} setRisk={setRisk} refresh={refresh} onToast={onToast} />}
+
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 flex flex-col gap-6 min-w-0">
           <section className="panel p-4 md:p-5">
@@ -432,7 +440,7 @@ function Dashboard({ data, now, refresh, onToast, onOpen }) {
             <div style={{ maxHeight: 420, overflow: "auto", borderTop: "1px solid var(--line)" }}>
               <table className="tbl">
                 <thead>
-                  <tr><th>Name</th><th>Student number</th><th>Section</th><th>Status</th><th>{filter === "waitlist" ? "" : "Identified by"}</th></tr>
+                  <tr><th>Name</th><th>Student number</th><th>Section</th><th title="For people not in yet: their chance of coming, from the turnout forecast">Status</th><th>{filter === "waitlist" ? "" : "Identified by"}</th></tr>
                 </thead>
                 <tbody>
                   {rows.map((s) => {
@@ -442,8 +450,9 @@ function Dashboard({ data, now, refresh, onToast, onOpen }) {
                         <td className="font-bold">{formatName(s)}</td>
                         <td className="muted">{s.id}</td>
                         <td className="muted">{s.section}</td>
-                        <td>{s.reg ? <span className="chip confirmed">Waitlist since {fmtDateShort(s.reg.createdAt)}</span>
-                          : c ? <span className="chip in">In at {fmtTime(c.time)}</span> : <span className="faint">Not yet</span>}</td>
+                        <td>{s.reg ? <div className="flex items-center gap-3"><span className="chip confirmed">Waitlist since {fmtDateShort(s.reg.createdAt)}</span>{likely(s.reg)}</div>
+                          : c ? <span className="chip in">In at {fmtTime(c.time)}</span>
+                          : <div className="flex items-center gap-3"><span className="faint">Not yet</span>{likely(data.regByStudent.get(s.id))}</div>}</td>
                         <td>{s.reg ? <button className="btn btn-sm" onClick={() => promote(s.reg)}>Move to going</button>
                           : c ? <MethodChip method={c.method} confidence={c.confidence} /> : null}</td>
                       </tr>
@@ -1229,6 +1238,8 @@ function Analytics({ data, now, onToast, refresh }) {
         </section>
 
         {data.matcher && <MatcherPanel m={data.matcher} onToast={onToast} refresh={refresh} />}
+
+        <TurnoutModelPanel forecast={data.forecast} />
 
         <section className="panel p-4 md:p-5 min-w-0 lg:col-span-2">
           <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">

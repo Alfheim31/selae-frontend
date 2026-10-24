@@ -186,7 +186,7 @@ export function EventPage({ id }) {
                 </h2>
                 <p className="muted">
                   {ticket.status === "waitlist"
-                    ? "You'll be moved to going automatically if someone cancels. Your ticket page will update."
+                    ? "You'll be moved to going if a spot opens up, in waitlist order. Your ticket page will update."
                     : `Registered as ${formatName(ticket.student)}. Show your QR ticket at the entrance.`}
                 </p>
                 <button className="btn btn-gold self-start" onClick={() => go(`t/${ticket.code}`)}><Ticket size={17} /> View my ticket</button>
@@ -242,7 +242,7 @@ function RegisterForm({ event }) {
       <div>
         <h2 id="reg-h" className="font-bold text-lg">Registration</h2>
         <p className="muted text-sm">
-          {full ? "This event is full. Join the waitlist and you'll get a spot automatically if someone cancels."
+          {full ? "This event is full. Join the waitlist: when spots open up, people move to going in waitlist order."
             : `${event.spotsLeft} of ${event.capacity} spots left.`}
         </p>
       </div>
